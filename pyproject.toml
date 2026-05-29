@@ -1,0 +1,54 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "beso"
+version = "0.0.1"
+description = "Bayesian Evolutionary Skill Optimization: trajectory-grounded reflective evolution of natural-language skill artifacts for frozen LLM agents, with a Bayesian surrogate + acquisition experiment-planning layer."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "BESO Authors" }]
+keywords = [
+    "bayesian-optimization",
+    "evolutionary-search",
+    "skill-optimization",
+    "llm-agents",
+    "prompt-optimization",
+]
+
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "scikit-learn>=1.3",
+    "pydantic>=2.5",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+embeddings = ["sentence-transformers>=2.2"]
+tracking = ["mlflow>=2.9"]
+dev = [
+    "pytest>=7.4",
+    "pytest-cov>=4.1",
+    "ruff>=0.1",
+    "mypy>=1.7",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["beso*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.mypy]
+python_version = "3.10"
+warn_unused_configs = true
+disallow_untyped_defs = true
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

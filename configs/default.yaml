@@ -1,0 +1,85 @@
+experiment:
+  name: beso_v0
+  seed: 42
+
+artifact:
+  type: skill
+  max_tokens: 900
+  compiler_mode: full
+
+optimization:
+  max_rollouts: 300
+  max_iterations: 30
+  batch_size: 2
+  candidate_pool_size: 24
+  archive_size: 32
+  min_improvement_delta: 0.01
+
+edits:
+  max_added_tokens_per_iteration: 120
+  max_deleted_tokens_per_iteration: 80
+  max_replaced_tokens_per_iteration: 160
+  max_sections_modified_per_iteration: 2
+  allowed_operations:
+    - append
+    - insert_after
+    - replace
+    - delete
+
+surrogate:
+  type: ensemble
+  target: delta            # parent-relative Delta(z, z_p) hybrid
+  ensemble_members: 8      # homogeneous bootstrap-bagged
+  uncertainty: epistemic_plus_aleatoric
+  calibration: isotonic
+  cold_start_iterations: 5
+
+features:
+  parent_centered: true
+  per_block_standardize: true
+  text_embedding_dims: 32  # PCA-reduced text block
+
+acquisition:
+  type: pool_normalized_ucb
+  normalize_terms: true
+  kappa: 1.5               # non-decaying / adaptive
+  diversity_lambda: 0.2
+  cost_alpha: 0.1
+  invalid_gamma: 0.1
+  batch_selection: max_min # submodular; in-batch reference updates
+
+gate:
+  test: paired_bootstrap   # mcnemar for small binary splits
+  multiplicity_correction: benjamini_hochberg
+  noise_scaled_delta_c: 1.0
+  constraint_confidence_bound: true
+  revalidate_incumbent_every: 5
+
+archive:
+  strategy: pareto_and_diversity
+  top_by_validation: 8
+  top_by_pareto: 8
+  top_by_diversity: 8
+  top_failed_informative: 8
+
+regime_detector:
+  enabled: true
+  min_candidate_variance: 1.0e-4
+  min_rank_correlation: 0.1
+
+reflection:
+  model: optimizer_model
+  require_trace_grounding: true
+  include_rejected_edits: true
+
+evaluation:
+  target_model: target_model
+  decoding_temperature: 0.0
+  score_field: hard
+  repeated_eval_for_top_candidates: true
+
+splits:
+  feedback_train: 0.40
+  optimization_minibatch: 0.20
+  validation_gate: 0.20
+  final_test: 0.20
