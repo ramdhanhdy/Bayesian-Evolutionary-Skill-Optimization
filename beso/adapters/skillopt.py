@@ -465,7 +465,11 @@ def _reflection_prompt(
         f"- {e.operation.value}: {e.content[:160]}" for e in rejected[-10:]
     ]
     failure_lines = [
-        f"- {t.example_id}: score={t.score} feedback={t.feedback[:160]}"
+        (
+            f"- {t.example_id}: score={t.score} "
+            f"input={t.task_input[:160]!r} output={t.output[:160]!r} "
+            f"feedback={t.feedback[:160]!r}"
+        )
         for t in failures[:10]
     ]
     return (

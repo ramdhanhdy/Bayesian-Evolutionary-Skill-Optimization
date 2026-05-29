@@ -28,6 +28,7 @@ dependencies = [
 
 [project.optional-dependencies]
 embeddings = ["sentence-transformers>=2.2"]
+llm = ["litellm>=1.0"]
 tracking = ["mlflow>=2.9"]
 dev = [
     "pytest>=7.4",
