@@ -4,3 +4,27 @@ The SkillOpt adapters wrap the reusable upstream "plumbing" (execution harness,
 edit applicator, evaluator, dataloaders, skill serialization) so the rest of
 BESO depends only on ``beso.core.protocols`` interfaces.
 """
+
+from beso.adapters.skillopt import (
+    SkillOptDatasetProvider,
+    SkillOptEditApplicator,
+    SkillOptEvaluator,
+    SkillOptHarness,
+    SkillOptReflectionProposer,
+    SkillOptSerializer,
+    apply_markdown_edit,
+    exact_match_score,
+    llm_generate,
+)
+
+__all__ = [
+    "SkillOptDatasetProvider",
+    "SkillOptEditApplicator",
+    "SkillOptEvaluator",
+    "SkillOptHarness",
+    "SkillOptReflectionProposer",
+    "SkillOptSerializer",
+    "apply_markdown_edit",
+    "exact_match_score",
+    "llm_generate",
+]
