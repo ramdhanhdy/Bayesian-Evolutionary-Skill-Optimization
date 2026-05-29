@@ -1,18 +1,26 @@
-"""Run a tiny live BESO experiment through OpenRouter via LiteLLM.
+"""Run a tiny live BESO experiment through LiteLLM.
 
 Required environment:
     OPENROUTER_API_KEY=...
+    # or
+    DEEPSEEK_API_KEY=...
 
 Optional environment:
+    BESO_LITELLM_MODEL=deepseek/deepseek-chat
+    BESO_LITELLM_PROVIDER=deepseek
+    BESO_LITELLM_API_KEY=...
     BESO_OPENROUTER_MODEL=openrouter/openai/gpt-5
     BESO_OPENROUTER_API_BASE=https://openrouter.ai/api/v1
     BESO_OPENROUTER_SITE_URL=https://example.com
     BESO_OPENROUTER_APP_NAME=BESO Toy Experiment
+    BESO_DEEPSEEK_MODEL=deepseek/deepseek-chat
+    BESO_DEEPSEEK_API_BASE=https://api.deepseek.com
 """
 
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from typing import Sequence
 
 import numpy as np
@@ -51,8 +59,63 @@ from beso.optimization import (
 )
 from beso.surrogate import BaggingEnsembleSurrogate, IsotonicCalibrator
 
-MODEL = os.getenv("BESO_OPENROUTER_MODEL", "openrouter/openai/gpt-5")
-SEED = int(os.getenv("BESO_SEED", "7"))
+_PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+def load_dotenv_file(path: Path) -> None:
+    """Minimal .env loader so the example works without python-dotenv."""
+
+    if not path.exists():
+        return
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+load_dotenv_file(_PROJECT_ROOT / ".env")
+load_dotenv_file(Path.cwd() / ".env")
+
+
+def env_value(*names: str, default: str = "") -> str:
+    for name in names:
+        value = os.getenv(name)
+        if value:
+            return value
+    return default
+
+
+PROVIDER_HINT = env_value("BESO_LITELLM_PROVIDER").lower()
+if PROVIDER_HINT == "deepseek":
+    DEFAULT_MODEL = "deepseek/deepseek-chat"
+    MODEL = env_value("BESO_LITELLM_MODEL", "BESO_DEEPSEEK_MODEL", default=DEFAULT_MODEL)
+elif PROVIDER_HINT == "openrouter":
+    DEFAULT_MODEL = "openrouter/openai/gpt-5"
+    MODEL = env_value(
+        "BESO_LITELLM_MODEL",
+        "BESO_OPENROUTER_MODEL",
+        "BESO_OPENROUTERL_MODEL",
+        default=DEFAULT_MODEL,
+    )
+else:
+    DEFAULT_MODEL = (
+        "deepseek/deepseek-chat"
+        if env_value("DEEPSEEK_API_KEY", "BESO_DEEPSEEK_API_KEY")
+        else "openrouter/openai/gpt-5"
+    )
+    MODEL = env_value(
+        "BESO_LITELLM_MODEL",
+        "BESO_DEEPSEEK_MODEL",
+        "BESO_OPENROUTER_MODEL",
+        "BESO_OPENROUTERL_MODEL",
+        default=DEFAULT_MODEL,
+    )
+SEED = int(env_value("BESO_SEED", default="7"))
 
 REFLECTION_SYSTEM_INSTRUCTION = """You are BESO's deterministic skill mutation engine.
 
@@ -169,26 +232,65 @@ class LoggingBESOOptimizer(BESOOptimizer):
         )
 
 
-def openrouter_completion(
+def _provider_for_model(model: str) -> str:
+    if PROVIDER_HINT:
+        return PROVIDER_HINT
+    if model.startswith("openrouter/"):
+        return "openrouter"
+    if model.startswith("deepseek/") or model.startswith("deepseek-"):
+        return "deepseek"
+    return "generic"
+
+
+def _litellm_model_name(model: str, provider: str) -> str:
+    if provider == "deepseek" and "/" not in model:
+        return f"deepseek/{model}"
+    if provider == "openrouter" and "/" not in model:
+        return f"openrouter/{model}"
+    return model
+
+
+def _api_key_for_provider(provider: str) -> str:
+    if provider == "deepseek":
+        return env_value(
+            "DEEPSEEK_API_KEY",
+            "BESO_DEEPSEEK_API_KEY",
+            "BESO_LITELLM_API_KEY",
+        )
+    if provider == "openrouter":
+        return env_value(
+            "OPENROUTER_API_KEY",
+            "BESO_OPENROUTER_API_KEY",
+            "BESO_LITELLM_API_KEY",
+        )
+    return env_value("BESO_LITELLM_API_KEY")
+
+
+def litellm_completion(
     prompt: str,
     *,
     system: str,
     max_tokens: int,
     temperature: float = 0.0,
 ) -> str:
-    """LiteLLM call configured for OpenRouter."""
+    """Provider-aware LiteLLM chat completion."""
 
     try:
         import litellm
     except ImportError as exc:
         raise RuntimeError("Install LiteLLM first: pip install litellm") from exc
 
-    api_key = os.getenv("OPENROUTER_API_KEY")
+    provider = _provider_for_model(MODEL)
+    model = _litellm_model_name(MODEL, provider)
+    api_key = _api_key_for_provider(provider)
     if not api_key:
-        raise RuntimeError("Set OPENROUTER_API_KEY before running this script")
+        raise RuntimeError(
+            "Set a provider API key before running this script "
+            "(DEEPSEEK_API_KEY, OPENROUTER_API_KEY, or BESO_LITELLM_API_KEY)"
+        )
 
     kwargs = {
-        "model": MODEL,
+        "model": model,
         "messages": [
             {"role": "system", "content": system},
             {"role": "user", "content": prompt},
@@ -197,13 +299,17 @@ def openrouter_completion(
         "temperature": temperature,
         "max_tokens": max_tokens,
     }
-    api_base = os.getenv("BESO_OPENROUTER_API_BASE")
+    api_base = env_value("BESO_LITELLM_API_BASE")
+    if provider == "openrouter":
+        api_base = api_base or env_value("BESO_OPENROUTER_API_BASE")
+    elif provider == "deepseek":
+        api_base = api_base or env_value("BESO_DEEPSEEK_API_BASE")
     if api_base:
         kwargs["api_base"] = api_base
     headers = {}
-    if os.getenv("BESO_OPENROUTER_SITE_URL"):
+    if provider == "openrouter" and os.getenv("BESO_OPENROUTER_SITE_URL"):
         headers["HTTP-Referer"] = os.environ["BESO_OPENROUTER_SITE_URL"]
-    if os.getenv("BESO_OPENROUTER_APP_NAME"):
+    if provider == "openrouter" and os.getenv("BESO_OPENROUTER_APP_NAME"):
         headers["X-Title"] = os.environ["BESO_OPENROUTER_APP_NAME"]
     if headers:
         kwargs["extra_headers"] = headers
@@ -214,26 +320,29 @@ def openrouter_completion(
 
 
 def target_llm(prompt: str) -> str:
-    return openrouter_completion(
+    return litellm_completion(
         prompt,
         system=TARGET_SYSTEM_INSTRUCTION,
-        max_tokens=int(os.getenv("BESO_TARGET_MAX_TOKENS", "64")),
+        max_tokens=int(env_value("BESO_TARGET_MAX_TOKENS", default="64")),
         temperature=0.0,
     )
 
 
 def reflection_llm(prompt: str) -> str:
-    return openrouter_completion(
+    return litellm_completion(
         prompt,
         system=REFLECTION_SYSTEM_INSTRUCTION,
-        max_tokens=int(os.getenv("BESO_REFLECTION_MAX_TOKENS", "12000")),
+        max_tokens=int(env_value("BESO_REFLECTION_MAX_TOKENS", default="12000")),
         temperature=0.0,
     )
 
 
 def numeric_exact_score(output: str, item: dict) -> float:
     expected = str(item["answers"][0]).strip()
-    cleaned = output.strip().splitlines()[-1].strip()
+    lines = output.strip().splitlines()
+    if not lines:
+        return 0.0
+    cleaned = lines[-1].strip()
     cleaned = cleaned.replace(",", "")
     return 1.0 if cleaned == expected else 0.0
 
@@ -380,9 +489,13 @@ def build_optimizer() -> LoggingBESOOptimizer:
 
 def main() -> None:
     np.random.seed(SEED)
-    print(f"BESO toy live experiment using model: {MODEL}")
+    provider = _provider_for_model(MODEL)
+    model = _litellm_model_name(MODEL, provider)
+    key_status = "found" if _api_key_for_provider(provider) else "missing"
+    print(f"BESO toy live experiment using LiteLLM model: {model}")
+    print(f"LiteLLM provider: {provider}")
     print("Reflection pool size: 24")
-    print("Set OPENROUTER_API_KEY before running.\n")
+    print(f"Provider API key: {key_status}\n")
 
     optimizer = build_optimizer()
     initial = SkillArtifact(

@@ -3,3 +3,6 @@
 *.pyc
 *.pyo
 *__pycache__
+.env
+.venv/*
+*.egg-info/
