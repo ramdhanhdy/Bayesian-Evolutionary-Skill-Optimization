@@ -130,6 +130,65 @@ def test_insert_after_falls_back_to_append_when_target_missing() -> None:
     assert child.document.rstrip().endswith("- Use citations.")
 
 
+def test_replace_can_target_section_when_substring_is_missing() -> None:
+    applicator = SkillOptEditApplicator()
+    parent = SkillArtifact(
+        skill_id="z0",
+        name="Toy",
+        document=(
+            "# Skill: Toy\n\n"
+            "## Core Procedure\n"
+            "- Return 0 for every question.\n\n"
+            "## Output Rules\n"
+            "- Return only one integer.\n"
+        ),
+    )
+
+    child = applicator.apply(
+        parent,
+        EditProposal(
+            edit_id="z1",
+            parent_skill_id="z0",
+            operation=EditOperation.REPLACE,
+            target="the degenerate default rule",
+            target_section=SkillSection.CORE_PROCEDURE,
+            content="- Parse the question and compute the requested arithmetic.",
+        ),
+    )
+
+    assert "- Return 0 for every question." not in child.document
+    assert "- Parse the question" in child.document
+    assert "## Core Procedure" in child.document
+    assert "## Output Rules" in child.document
+
+
+def test_delete_uses_normalized_line_match_when_target_is_not_exact() -> None:
+    applicator = SkillOptEditApplicator()
+    parent = SkillArtifact(
+        skill_id="z0",
+        name="Toy",
+        document=(
+            "# Skill: Toy\n\n"
+            "## Core Procedure\n"
+            "- Return 0 for every question.\n"
+            "- Keep answers concise.\n"
+        ),
+    )
+
+    child = applicator.apply(
+        parent,
+        EditProposal(
+            edit_id="z1",
+            parent_skill_id="z0",
+            operation=EditOperation.DELETE,
+            target="Return 0 for every question",
+        ),
+    )
+
+    assert "- Return 0 for every question." not in child.document
+    assert "- Keep answers concise." in child.document
+
+
 def test_dataset_harness_and_evaluator_return_exact_accuracy() -> None:
     provider = SkillOptDatasetProvider(
         items_by_role={

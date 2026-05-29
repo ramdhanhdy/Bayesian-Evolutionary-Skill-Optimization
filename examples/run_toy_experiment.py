@@ -15,6 +15,10 @@ Optional environment:
     BESO_OPENROUTER_APP_NAME=BESO Toy Experiment
     BESO_DEEPSEEK_MODEL=deepseek/deepseek-chat
     BESO_DEEPSEEK_API_BASE=https://api.deepseek.com
+    BESO_GATE_ALPHA=0.10
+    BESO_BH_ALPHA=0.10
+    BESO_VALIDATION_BATCH_SIZE=10
+    BESO_MAX_ROLLOUTS=160
 """
 
 from __future__ import annotations
@@ -56,6 +60,7 @@ from beso.optimization import (
     PairedBootstrapAcceptanceGate,
     RegimeDetectorConfig,
     VarianceRankRegimeDetector,
+    apply_benjamini_hochberg,
 )
 from beso.surrogate import BaggingEnsembleSurrogate, IsotonicCalibrator
 
@@ -116,6 +121,8 @@ else:
         default=DEFAULT_MODEL,
     )
 SEED = int(env_value("BESO_SEED", default="7"))
+GATE_ALPHA = float(env_value("BESO_GATE_ALPHA", default="0.10"))
+BH_ALPHA = float(env_value("BESO_BH_ALPHA", default=str(GATE_ALPHA)))
 
 REFLECTION_SYSTEM_INSTRUCTION = """You are BESO's deterministic skill mutation engine.
 
@@ -146,6 +153,10 @@ Hard requirements:
     profiles, and hypotheses. Do not produce near-duplicates.
 11. Be deterministic: do not add random commentary, jokes, or vague edits.
 12. Preserve task invariants and output format requirements.
+13. If the current skill contains a contradictory or degenerate rule that
+    directly explains failures, include multiple replace/delete edits that
+    target that exact rule or its full section. Prefer replacing the faulty
+    core_procedure over merely appending advice.
 """
 
 TARGET_SYSTEM_INSTRUCTION = """You are executing a toy benchmark with a supplied skill.
@@ -347,6 +358,28 @@ def numeric_exact_score(output: str, item: dict) -> float:
     return 1.0 if cleaned == expected else 0.0
 
 
+def log_and_apply_bh(decisions):
+    if not decisions:
+        return []
+    print("[gate] raw paired decisions")
+    for decision in decisions:
+        print(
+            f"  {decision.candidate_id}: accepted={decision.accepted} "
+            f"diff={decision.mean_diff:.3f} ci=[{decision.ci_low:.3f}, "
+            f"{decision.ci_high:.3f}] p={decision.p_value:.4f} "
+            f"threshold={decision.noise_scaled_threshold:.3f} "
+            f"reason={decision.reason}"
+        )
+    corrected = apply_benjamini_hochberg(decisions, alpha=BH_ALPHA)
+    print(f"[gate] BH correction alpha={BH_ALPHA:.3f}")
+    for decision in corrected:
+        print(
+            f"  {decision.candidate_id}: accepted={decision.accepted} "
+            f"p={decision.p_value:.4f} reason={decision.reason}"
+        )
+    return corrected
+
+
 def toy_dataset() -> dict[SplitRole, list[dict]]:
     train = [
         {
@@ -411,6 +444,36 @@ def toy_dataset() -> dict[SplitRole, list[dict]]:
             "answers": ["6"],
             "feedback": "Expected 6.",
         },
+        {
+            "id": "val_add_2",
+            "question": "A jar has 11 buttons and 13 more are added. Total buttons?",
+            "answers": ["24"],
+            "feedback": "Expected 24.",
+        },
+        {
+            "id": "val_sub_2",
+            "question": "There were 25 balloons. 9 popped. How many remain?",
+            "answers": ["16"],
+            "feedback": "Expected 16.",
+        },
+        {
+            "id": "val_mul_2",
+            "question": "7 boxes each contain 3 pencils. How many pencils?",
+            "answers": ["21"],
+            "feedback": "Expected 21.",
+        },
+        {
+            "id": "val_mix_2",
+            "question": "Sara had 6 shells, found 8, then gave away 5. How many?",
+            "answers": ["9"],
+            "feedback": "Expected 9.",
+        },
+        {
+            "id": "val_div_2",
+            "question": "42 stickers are shared equally among 7 kids. Stickers each?",
+            "answers": ["6"],
+            "feedback": "Expected 6.",
+        },
     ]
     return {
         SplitRole.FEEDBACK_TRAIN: train,
@@ -459,10 +522,14 @@ def build_optimizer() -> LoggingBESOOptimizer:
         batch_selector=batch_selector,
         gate=PairedBootstrapAcceptanceGate(
             AcceptanceGateConfig(
-                alpha=0.10,
-                bootstrap_samples=512,
+                alpha=GATE_ALPHA,
+                bootstrap_samples=int(
+                    env_value("BESO_BOOTSTRAP_SAMPLES", default="512")
+                ),
                 bootstrap_seed=SEED,
-                noise_scaled_delta_c=0.5,
+                noise_scaled_delta_c=float(
+                    env_value("BESO_NOISE_DELTA_C", default="0.5")
+                ),
             )
         ),
         archive=archive,
@@ -475,15 +542,20 @@ def build_optimizer() -> LoggingBESOOptimizer:
             )
         ),
         config=BESOOptimizerConfig(
-            max_iterations=int(os.getenv("BESO_MAX_ITERATIONS", "4")),
+            max_iterations=int(env_value("BESO_MAX_ITERATIONS", default="4")),
             candidate_pool_size=24,
             batch_size=2,
             parent_count=1,
-            optimization_batch_size=3,
-            validation_batch_size=5,
+            optimization_batch_size=int(
+                env_value("BESO_OPTIMIZATION_BATCH_SIZE", default="3")
+            ),
+            validation_batch_size=int(
+                env_value("BESO_VALIDATION_BATCH_SIZE", default="10")
+            ),
             seed=SEED,
             fallback_strategy="greedy",
         ),
+        multiplicity_correction=log_and_apply_bh,
     )
 
 
@@ -495,6 +567,7 @@ def main() -> None:
     print(f"BESO toy live experiment using LiteLLM model: {model}")
     print(f"LiteLLM provider: {provider}")
     print("Reflection pool size: 24")
+    print(f"Gate alpha: {GATE_ALPHA:.3f}; BH alpha: {BH_ALPHA:.3f}")
     print(f"Provider API key: {key_status}\n")
 
     optimizer = build_optimizer()
@@ -505,7 +578,7 @@ def main() -> None:
     )
     result = optimizer.optimize(
         initial,
-        RolloutBudget(max_rollouts=int(os.getenv("BESO_MAX_ROLLOUTS", "100"))),
+        RolloutBudget(max_rollouts=int(env_value("BESO_MAX_ROLLOUTS", default="160"))),
     )
 
     print("\n=== Run Summary ===")

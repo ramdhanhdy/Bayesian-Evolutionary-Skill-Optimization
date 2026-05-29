@@ -13,11 +13,13 @@ from beso.core.types import (
     RolloutBudget,
     SkillArtifact,
     SkillMetadata,
+    SkillSection,
     SplitRole,
     SurrogatePrediction,
     Trajectory,
 )
 from beso.optimization import BESOOptimizer, BESOOptimizerConfig
+from beso.adapters import SkillOptEditApplicator
 
 
 class FakeDataset:
@@ -267,6 +269,109 @@ def test_optimizer_regime_fallback_bypasses_bayesian_math() -> None:
     assert acquisition.calls == 0
     assert selector.calls == 0
     assert regime.calls == 1
+
+
+class PoisonRepairProposer:
+    def propose_pool(
+        self,
+        parent: SkillArtifact,
+        trajectories: Sequence[Trajectory],
+        rejected: Sequence[EditProposal],
+        pool_size: int,
+    ) -> list[EditProposal]:
+        return [
+            EditProposal(
+                edit_id="append_weak",
+                parent_skill_id=parent.skill_id,
+                operation=EditOperation.APPEND,
+                content="- Try harder, but keep existing procedure.",
+            ),
+            EditProposal(
+                edit_id="replace_poison",
+                parent_skill_id=parent.skill_id,
+                operation=EditOperation.REPLACE,
+                target="Return 0 for every question",
+                target_section=SkillSection.CORE_PROCEDURE,
+                content="- Parse the question and compute the requested arithmetic.",
+            ),
+        ][:pool_size]
+
+
+class PoisonEvaluator(FakeEvaluator):
+    def __init__(self) -> None:
+        super().__init__({})
+
+    def evaluate(
+        self,
+        skill: SkillArtifact,
+        role: SplitRole,
+        example_ids: Sequence[str],
+        seed: int,
+    ) -> EvaluationResult:
+        ids = tuple(example_ids)
+        self.calls.append((skill.skill_id, role, ids))
+        score = 0.0 if "Return 0 for every question" in skill.document else 1.0
+        trajectories = [
+            Trajectory(example_id=example_id, task_input="", score=score)
+            for example_id in ids
+        ]
+        return EvaluationResult(
+            candidate_id=skill.skill_id,
+            split=role,
+            per_example_scores={example_id: score for example_id in ids},
+            trajectories=trajectories,
+        )
+
+
+def test_greedy_fallback_prioritizes_poison_repair_edit() -> None:
+    archive = EvolutionaryArchive(
+        ArchiveConfig(
+            max_size=8,
+            top_by_validation=4,
+            top_by_pareto=2,
+            top_by_diversity=2,
+            top_failed_informative=0,
+        )
+    )
+    opt = BESOOptimizer(
+        dataset=FakeDataset(),
+        evaluator=PoisonEvaluator(),
+        proposer=PoisonRepairProposer(),
+        applicator=SkillOptEditApplicator(),
+        featurizer=FakeFeaturizer(),
+        surrogate=FakeSurrogate(),
+        acquisition=FakeAcquisition(),
+        batch_selector=SortBatchSelector(),
+        gate=FakeGate(),
+        archive=archive,
+        regime_detector=ToggleRegime(False),
+        config=BESOOptimizerConfig(
+            max_iterations=1,
+            candidate_pool_size=2,
+            batch_size=1,
+            optimization_batch_size=1,
+            validation_batch_size=1,
+            seed=11,
+            fallback_strategy="greedy",
+        ),
+        multiplicity_correction=lambda decisions: list(decisions),
+    )
+    initial = SkillArtifact(
+        skill_id="z0",
+        name="seed",
+        document=(
+            "# Skill: Toy\n\n"
+            "## Core Procedure\n"
+            "- Return 0 for every question.\n"
+        ),
+    )
+
+    result = opt.optimize(initial, RolloutBudget(max_rollouts=5))
+
+    assert result.iterations[0].selected_ids == ["replace_poison"]
+    assert result.iterations[0].accepted_ids == ["replace_poison"]
+    assert result.best is not None
+    assert result.best.candidate_id == "replace_poison"
 
 
 def test_optimizer_stops_when_rollout_budget_is_exhausted() -> None:

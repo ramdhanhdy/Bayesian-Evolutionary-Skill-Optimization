@@ -298,13 +298,9 @@ def apply_markdown_edit(markdown: str, edit: EditProposal) -> str:
     if op is EditOperation.INSERT_AFTER:
         return _insert_after(markdown, target, content)
     if op is EditOperation.REPLACE:
-        if not target or target not in markdown:
-            return markdown
-        return markdown.replace(target, content, 1)
+        return _replace(markdown, target, content, edit.target_section)
     if op is EditOperation.DELETE:
-        if not target or target not in markdown:
-            return markdown
-        return markdown.replace(target, "", 1)
+        return _delete(markdown, target, edit.target_section)
     if op is EditOperation.MERGE:
         return _append(markdown, content)
     return markdown
@@ -336,6 +332,121 @@ def _insert_after(markdown: str, target: str, content: str) -> str:
     newline = markdown.find("\n", idx)
     insert_at = newline + 1 if newline != -1 else len(markdown)
     return markdown[:insert_at] + "\n" + content + "\n" + markdown[insert_at:]
+
+
+def _replace(
+    markdown: str,
+    target: str,
+    content: str,
+    section: SkillSection | None,
+) -> str:
+    if target:
+        if target in markdown:
+            return markdown.replace(target, content, 1)
+        line_replaced = _replace_fuzzy_line(markdown, target, content)
+        if line_replaced is not None:
+            return line_replaced
+    if section is not None:
+        return _replace_section(markdown, section, content)
+    return markdown
+
+
+def _delete(
+    markdown: str,
+    target: str,
+    section: SkillSection | None,
+) -> str:
+    if target:
+        if target in markdown:
+            return markdown.replace(target, "", 1)
+        line_deleted = _replace_fuzzy_line(markdown, target, "")
+        if line_deleted is not None:
+            return line_deleted
+    if section is not None:
+        return _replace_section(markdown, section, "")
+    return markdown
+
+
+def _replace_fuzzy_line(
+    markdown: str,
+    target: str,
+    content: str,
+) -> str | None:
+    target_key = _line_match_key(target)
+    if not target_key:
+        return None
+    parts = markdown.splitlines(keepends=True)
+    for idx, line in enumerate(parts):
+        line_key = _line_match_key(line)
+        if not line_key:
+            continue
+        if target_key == line_key or (
+            len(target_key) >= 8
+            and (target_key in line_key or line_key in target_key)
+        ):
+            newline = "\n" if line.endswith("\n") else ""
+            replacement = content.rstrip()
+            parts[idx] = f"{replacement}{newline}" if replacement else ""
+            return "".join(parts)
+    return None
+
+
+def _replace_section(
+    markdown: str,
+    section: SkillSection,
+    content: str,
+) -> str:
+    span = _section_span(markdown, section)
+    if span is None:
+        section_text = f"## {_section_title(section)}"
+        if content.strip():
+            section_text += f"\n{content.strip()}"
+        return _append(markdown, section_text)
+
+    section_start, heading_end, body_start, section_end = span
+    replacement = content.strip()
+    if _starts_with_heading(replacement):
+        before = markdown[:section_start].rstrip()
+        after = markdown[section_end:].lstrip("\n")
+        return _join_markdown_blocks(before, replacement, after)
+
+    before = markdown[:body_start].rstrip()
+    after = markdown[section_end:].lstrip("\n")
+    return _join_markdown_blocks(before, replacement, after)
+
+
+def _section_span(
+    markdown: str,
+    section: SkillSection,
+) -> tuple[int, int, int, int] | None:
+    matches = list(_HEADING_RE.finditer(markdown))
+    for idx, match in enumerate(matches):
+        if len(match.group(1)) != 2 or _section_key(match.group(2)) is not section:
+            continue
+        section_start = match.start()
+        heading_end = match.end()
+        body_start = heading_end
+        if body_start < len(markdown) and markdown[body_start] == "\n":
+            body_start += 1
+        section_end = matches[idx + 1].start() if idx + 1 < len(matches) else len(markdown)
+        return section_start, heading_end, body_start, section_end
+    return None
+
+
+def _starts_with_heading(text: str) -> bool:
+    return bool(_HEADING_RE.match(text.strip()))
+
+
+def _join_markdown_blocks(*blocks: str) -> str:
+    cleaned = [block.strip() for block in blocks if block.strip()]
+    return "\n\n".join(cleaned).rstrip() + "\n"
+
+
+def _line_match_key(text: str) -> str:
+    text = str(text).strip().lower()
+    text = re.sub(r"^[\s>*+\-`]+", "", text)
+    text = re.sub(r"`+", "", text)
+    return re.sub(r"[^a-z0-9]+", " ", text).strip()
 
 
 def _is_in_slow_update_region(markdown: str, target: str) -> bool:

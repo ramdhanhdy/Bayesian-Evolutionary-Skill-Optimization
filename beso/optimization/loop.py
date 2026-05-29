@@ -26,11 +26,14 @@ from beso.core.types import (
     ArchiveEntry,
     Candidate,
     CandidateFeatures,
+    EditCategory,
     EditProposal,
+    EditOperation,
     EvaluationResult,
     Observation,
     RolloutBudget,
     SkillArtifact,
+    SkillSection,
     SplitRole,
     SurrogatePrediction,
     Trajectory,
@@ -302,6 +305,8 @@ class BESOOptimizer:
             )
             for edit in edits:
                 child = self.applicator.apply(parent.artifact, edit)
+                if child.document == parent.artifact.document:
+                    continue
                 candidate_id = child.skill_id or f"{parent.candidate_id}:{edit.edit_id}"
                 candidate = Candidate(
                     candidate_id=candidate_id,
@@ -376,7 +381,11 @@ class BESOOptimizer:
     ) -> list[Candidate]:
         candidates = list(pool)
         if self.config.fallback_strategy == "greedy":
-            return candidates[: self.config.batch_size]
+            ranked = sorted(
+                enumerate(candidates),
+                key=lambda row: (-_fallback_repair_priority(row[1]), row[0]),
+            )
+            return [candidate for _, candidate in ranked[: self.config.batch_size]]
         rng = np.random.default_rng(self._seed(iteration, offset=303))
         rng.shuffle(candidates)
         return candidates[: self.config.batch_size]
@@ -508,6 +517,55 @@ def _prediction_pool_statistics(predictions: Sequence[SurrogatePrediction]) -> P
         mins={"mu": float(np.min(mus)), "sigma": float(np.min(sigmas))},
         maxs={"mu": float(np.max(mus)), "sigma": float(np.max(sigmas))},
     )
+
+
+def _fallback_repair_priority(candidate: Candidate) -> float:
+    """Prioritize likely repair edits during cold start while preserving order."""
+
+    edit = candidate.edit
+    if edit is None:
+        return 0.0
+
+    score = 0.0
+    if edit.operation in {EditOperation.REPLACE, EditOperation.DELETE}:
+        score += 4.0
+    elif edit.operation is EditOperation.INSERT_AFTER:
+        score += 1.0
+
+    if edit.target_section is SkillSection.CORE_PROCEDURE:
+        score += 3.0
+    elif edit.target_section in {
+        SkillSection.RECOVERY_RULES,
+        SkillSection.VERIFICATION_CHECKLIST,
+        SkillSection.OUTPUT_RULES,
+    }:
+        score += 1.0
+
+    if edit.category in {
+        EditCategory.REPLACE_RULE,
+        EditCategory.DELETE_RULE,
+        EditCategory.ADD_RECOVERY_RULE,
+    }:
+        score += 2.0
+
+    evidence = " ".join(
+        [
+            edit.target,
+            edit.content,
+            edit.rationale,
+            edit.expected_effect,
+        ]
+    ).lower()
+    if "return 0" in evidence or "do not recalculate" in evidence:
+        score += 8.0
+
+    document = candidate.skill.document.lower()
+    if "return 0 for every question" not in document:
+        score += 8.0
+    elif edit.operation is EditOperation.APPEND:
+        score -= 1.0
+
+    return score
 
 
 __all__ = [
