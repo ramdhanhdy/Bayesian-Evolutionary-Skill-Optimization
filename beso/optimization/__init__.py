@@ -7,6 +7,7 @@ when it is not yet predictive (cold start / negligible candidate variance).
 """
 
 from beso.optimization.accept_reject import (
+    PARETO_CLEANUP_REASON,
     AcceptanceGateConfig,
     PairedBootstrapAcceptanceGate,
     PairedTestResult,
@@ -14,7 +15,9 @@ from beso.optimization.accept_reject import (
     exact_mcnemar_one_sided,
     paired_differences,
     paired_test,
+    secondary_metric_gains,
 )
+from beso.optimization.logger import JSONLLogger
 from beso.optimization.loop import (
     BESOOptimizer,
     BESOOptimizerConfig,
@@ -28,10 +31,12 @@ from beso.optimization.regime import (
 )
 
 __all__ = [
+    "PARETO_CLEANUP_REASON",
     "AcceptanceGateConfig",
     "BESOOptimizer",
     "BESOOptimizerConfig",
     "IterationRecord",
+    "JSONLLogger",
     "OptimizationResult",
     "PairedBootstrapAcceptanceGate",
     "PairedTestResult",
@@ -41,5 +46,6 @@ __all__ = [
     "exact_mcnemar_one_sided",
     "paired_differences",
     "paired_test",
+    "secondary_metric_gains",
     "spearman_rank_correlation",
 ]

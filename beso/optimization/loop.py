@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import difflib
+import inspect
 from dataclasses import dataclass, field
 from typing import Callable, Optional, Sequence
 
@@ -38,7 +40,11 @@ from beso.core.types import (
     SurrogatePrediction,
     Trajectory,
 )
-from beso.optimization.accept_reject import apply_benjamini_hochberg
+from beso.optimization.accept_reject import (
+    PARETO_CLEANUP_REASON,
+    apply_benjamini_hochberg,
+)
+from beso.optimization.logger import JSONLLogger
 
 CandidateFilter = Callable[[Candidate], bool]
 MultiplicityCorrection = Callable[[Sequence[GateDecision]], list[GateDecision]]
@@ -123,6 +129,7 @@ class BESOOptimizer:
         config: Optional[BESOOptimizerConfig] = None,
         candidate_filter: CandidateFilter | None = None,
         multiplicity_correction: MultiplicityCorrection | None = None,
+        logger: Optional[JSONLLogger] = None,
     ) -> None:
         self.dataset = dataset
         self.evaluator = evaluator
@@ -140,6 +147,7 @@ class BESOOptimizer:
         self.multiplicity_correction = (
             multiplicity_correction or apply_benjamini_hochberg
         )
+        self.logger = logger
 
         self.observations: list[Observation] = []
         self.features: dict[str, CandidateFeatures] = {}
@@ -266,15 +274,20 @@ class BESOOptimizer:
         decisions = self.multiplicity_correction(decisions) if decisions else []
         accepted_ids = {d.candidate_id for d in decisions if d.accepted}
         rejected_ids = {d.candidate_id for d in decisions if not d.accepted}
+        cleanup_ids = {
+            d.candidate_id
+            for d in decisions
+            if d.accepted and d.reason.startswith(PARETO_CLEANUP_REASON)
+        }
         accepted = [c for c in selected if c.candidate_id in accepted_ids]
         accepted_evals = [val_evals[c.candidate_id] for c in accepted]
         if accepted:
-            self.archive.update(accepted, accepted_evals)
+            self._archive_update(accepted, accepted_evals, cleanup_ids)
         for candidate in selected:
             if candidate.candidate_id in rejected_ids and candidate.edit is not None:
                 self.rejected_edits.append(candidate.edit)
 
-        return IterationRecord(
+        record = IterationRecord(
             iteration=iteration,
             used_surrogate=use_surrogate,
             fallback_reason=fallback_reason,
@@ -287,6 +300,93 @@ class BESOOptimizer:
             budget_spent=budget.spent_rollouts,
             budget_remaining=budget.remaining,
         )
+        self._log_iteration(
+            iteration=iteration,
+            budget=budget,
+            pool=pool,
+            selected=selected,
+            parents=parents,
+            opt_evals=opt_evals,
+            val_evals=val_evals,
+            decisions=decisions,
+        )
+        return record
+
+    def _log_iteration(
+        self,
+        *,
+        iteration: int,
+        budget: RolloutBudget,
+        pool: Sequence[Candidate],
+        selected: Sequence[Candidate],
+        parents: Sequence[ArchiveEntry],
+        opt_evals: dict[str, EvaluationResult],
+        val_evals: dict[str, EvaluationResult],
+        decisions: Sequence[GateDecision],
+    ) -> None:
+        if self.logger is None:
+            return
+
+        evals: dict[str, dict[str, dict[str, float]]] = {}
+        for cid, ev in opt_evals.items():
+            evals.setdefault(cid, {})["optimization"] = dict(ev.per_example_scores)
+        for cid, ev in val_evals.items():
+            evals.setdefault(cid, {})["validation"] = dict(ev.per_example_scores)
+
+        payload = {
+            "iteration": iteration,
+            "spent_rollouts": budget.spent_rollouts,
+            "budget_remaining": budget.remaining,
+            "pool_edits": [c.edit for c in pool if c.edit is not None],
+            "diffs": {
+                c.candidate_id: self._candidate_diff(c, parents) for c in selected
+            },
+            "predictions": {c.candidate_id: c.prediction for c in pool},
+            "acquisition_scores": {
+                c.candidate_id: c.acquisition_score for c in pool
+            },
+            "selected_ids": [c.candidate_id for c in selected],
+            "evals": evals,
+            "gate_decisions": list(decisions),
+            "archive_snapshot": list(self.archive.entries()),
+        }
+        self.logger.log(payload)
+
+    def _candidate_diff(
+        self,
+        candidate: Candidate,
+        parents: Sequence[ArchiveEntry],
+    ) -> str:
+        parent = self._parent_artifact(candidate.parent_id, parents)
+        parent_doc = parent.document if parent is not None else ""
+        diff = difflib.unified_diff(
+            parent_doc.splitlines(),
+            candidate.skill.document.splitlines(),
+            fromfile="parent",
+            tofile="child",
+            lineterm="",
+        )
+        return "\n".join(diff)
+
+    def _archive_update(
+        self,
+        accepted: Sequence[Candidate],
+        accepted_evals: Sequence[EvaluationResult],
+        cleanup_ids: set[str],
+    ) -> None:
+        """Update the archive, forwarding cleanup ids when supported."""
+
+        if cleanup_ids and self._archive_supports_cleanup():
+            self.archive.update(accepted, accepted_evals, cleanup_ids=cleanup_ids)
+        else:
+            self.archive.update(accepted, accepted_evals)
+
+    def _archive_supports_cleanup(self) -> bool:
+        try:
+            params = inspect.signature(self.archive.update).parameters
+        except (TypeError, ValueError):
+            return False
+        return "cleanup_ids" in params
 
     def _build_candidate_pool(
         self,

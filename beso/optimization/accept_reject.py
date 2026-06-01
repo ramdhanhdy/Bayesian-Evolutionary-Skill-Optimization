@@ -9,7 +9,9 @@ from typing import Sequence
 import numpy as np
 
 from beso.core.protocols import GateDecision
-from beso.core.types import EvaluationResult
+from beso.core.types import EvaluationResult, Trajectory
+
+PARETO_CLEANUP_REASON = "pareto_cleanup"
 
 
 @dataclass(frozen=True)
@@ -25,6 +27,7 @@ class AcceptanceGateConfig:
     max_invalid_rate: float = 1.0
     max_cost_per_task: float | None = None
     max_latency_seconds: float | None = None
+    cleanup_noninferiority_margin: float = 0.0
     eps: float = 1e-12
 
     def __post_init__(self) -> None:
@@ -34,6 +37,8 @@ class AcceptanceGateConfig:
             raise ValueError("confidence must be in (0, 1)")
         if self.bootstrap_samples <= 0:
             raise ValueError("bootstrap_samples must be positive")
+        if self.cleanup_noninferiority_margin < 0.0:
+            raise ValueError("cleanup_noninferiority_margin must be non-negative")
 
 
 @dataclass(frozen=True)
@@ -75,6 +80,10 @@ class PairedBootstrapAcceptanceGate:
             and test.mean_diff >= threshold
             and test.p_value <= self.config.alpha
         )
+        if not accepted:
+            cleanup = self.check_non_inferiority(candidate_eval, parent_eval)
+            if cleanup is not None:
+                return cleanup
         reason = _reason(
             accepted=accepted,
             method=test.method,
@@ -96,6 +105,59 @@ class PairedBootstrapAcceptanceGate:
             p_value=test.p_value,
             noise_scaled_threshold=threshold,
             constraints_satisfied=constraints_satisfied,
+        )
+
+    def check_non_inferiority(
+        self,
+        candidate_eval: EvaluationResult,
+        parent_eval: EvaluationResult,
+    ) -> GateDecision | None:
+        """Secondary gate for neutral "cleanup" edits (TICKET-004).
+
+        An edit qualifies as a Pareto cleanup when it does not degrade the
+        primary metric (paired mean difference >= 0) *and* it improves at least
+        one secondary objective (fewer child tokens, better format validity, or
+        lower latency). Such edits are accepted with a distinct
+        ``pareto_cleanup`` reason so the archive can route them away from the
+        primary ``best`` incumbent.
+        """
+
+        diffs = paired_differences(candidate_eval, parent_eval)
+        test = paired_test(
+            diffs,
+            candidate_scores=_ordered_scores(candidate_eval),
+            parent_scores=_ordered_scores(parent_eval),
+            config=self.config,
+        )
+        constraints_satisfied, _ = self._constraints(candidate_eval)
+        if not constraints_satisfied:
+            return None
+        # Cleanup is archive-only, but still requires confidence-bounded
+        # non-inferiority on the paired primary metric.
+        if (
+            test.ci_low
+            < -self.config.cleanup_noninferiority_margin - self.config.eps
+        ):
+            return None
+        gains = secondary_metric_gains(
+            candidate_eval,
+            parent_eval,
+            config=self.config,
+            eps=self.config.eps,
+        )
+        if not gains:
+            return None
+        threshold = self.config.noise_scaled_delta_c * test.se
+        return GateDecision(
+            candidate_id=candidate_eval.candidate_id,
+            accepted=True,
+            reason=f"{PARETO_CLEANUP_REASON}:{'+'.join(gains)}",
+            mean_diff=test.mean_diff,
+            ci_low=test.ci_low,
+            ci_high=test.ci_high,
+            p_value=test.p_value,
+            noise_scaled_threshold=threshold,
+            constraints_satisfied=True,
         )
 
     def _constraints(self, ev: EvaluationResult) -> tuple[bool, str]:
@@ -138,6 +200,99 @@ def paired_differences(
             float(candidate_eval.per_example_scores[i])
             - float(parent_eval.per_example_scores[i])
             for i in ids
+        ],
+        dtype=np.float64,
+    )
+
+
+def secondary_metric_gains(
+    candidate_eval: EvaluationResult,
+    parent_eval: EvaluationResult,
+    *,
+    config: AcceptanceGateConfig | None = None,
+    eps: float = 1e-12,
+) -> list[str]:
+    """Return the secondary objectives a candidate strictly improves.
+
+    Used by the Pareto non-inferiority gate. ``invalid_rate`` is treated as the
+    inverse of format validity (lower is better), since ``EvaluationResult`` has
+    no explicit format-validity field.
+    """
+
+    cfg = config or AcceptanceGateConfig()
+    gains: list[str] = []
+    if _secondary_gain_established(
+        candidate_eval,
+        parent_eval,
+        metric="cost_tokens",
+        aggregate_gain=parent_eval.mean_cost_tokens - candidate_eval.mean_cost_tokens,
+        config=cfg,
+        eps=eps,
+        allow_aggregate_fallback=True,
+    ):
+        gains.append("child_tokens")
+    if _secondary_gain_established(
+        candidate_eval,
+        parent_eval,
+        metric="invalid",
+        aggregate_gain=parent_eval.invalid_rate - candidate_eval.invalid_rate,
+        config=cfg,
+        eps=eps,
+    ):
+        gains.append("format_validity")
+    if _secondary_gain_established(
+        candidate_eval,
+        parent_eval,
+        metric="latency_seconds",
+        aggregate_gain=(
+            parent_eval.mean_latency_seconds - candidate_eval.mean_latency_seconds
+        ),
+        config=cfg,
+        eps=eps,
+    ):
+        gains.append("latency")
+    return gains
+
+
+def _secondary_gain_established(
+    candidate_eval: EvaluationResult,
+    parent_eval: EvaluationResult,
+    *,
+    metric: str,
+    aggregate_gain: float,
+    config: AcceptanceGateConfig,
+    eps: float,
+    allow_aggregate_fallback: bool = False,
+) -> bool:
+    paired = _paired_trajectory_gains(candidate_eval, parent_eval, metric)
+    if paired.size:
+        ci_low, _ = _bootstrap_ci(paired, config)
+        return ci_low > eps
+    return allow_aggregate_fallback and aggregate_gain > eps
+
+
+def _paired_trajectory_gains(
+    candidate_eval: EvaluationResult,
+    parent_eval: EvaluationResult,
+    metric: str,
+) -> np.ndarray:
+    candidate = {
+        trajectory.example_id: trajectory
+        for trajectory in candidate_eval.trajectories
+    }
+    parent = {trajectory.example_id: trajectory for trajectory in parent_eval.trajectories}
+    if not candidate or set(candidate) != set(parent):
+        return np.asarray([], dtype=np.float64)
+
+    def value(trajectory: Trajectory) -> float:
+        if metric == "invalid":
+            return 0.0 if trajectory.valid_output else 1.0
+        return float(getattr(trajectory, metric))
+
+    return np.asarray(
+        [
+            value(parent[example_id]) - value(candidate[example_id])
+            for example_id in sorted(candidate)
         ],
         dtype=np.float64,
     )
@@ -193,23 +348,30 @@ def apply_benjamini_hochberg(
 
     if not decisions:
         return []
-    m = len(decisions)
-    ordered = sorted(enumerate(decisions), key=lambda row: row[1].p_value)
-    cutoff_rank = -1
-    for rank, (_, decision) in enumerate(ordered, start=1):
-        if decision.p_value <= alpha * rank / m:
-            cutoff_rank = rank
 
-    accepted_ids = set()
-    if cutoff_rank >= 1:
-        accepted_ids = {
-            decision.candidate_id
-            for _, decision in ordered[:cutoff_rank]
-            if decision.accepted
-        }
+    # Pareto cleanup acceptances are non-inferiority decisions, not primary
+    # significance tests, so they bypass multiplicity correction (TICKET-004).
+    primary = [d for d in decisions if not _is_cleanup(d)]
+    m = len(primary)
+    accepted_ids: set[str] = set()
+    if m:
+        ordered = sorted(enumerate(primary), key=lambda row: row[1].p_value)
+        cutoff_rank = -1
+        for rank, (_, decision) in enumerate(ordered, start=1):
+            if decision.p_value <= alpha * rank / m:
+                cutoff_rank = rank
+        if cutoff_rank >= 1:
+            accepted_ids = {
+                decision.candidate_id
+                for _, decision in ordered[:cutoff_rank]
+                if decision.accepted
+            }
 
     corrected: list[GateDecision] = []
     for decision in decisions:
+        if _is_cleanup(decision):
+            corrected.append(decision)
+            continue
         accepted = decision.accepted and decision.candidate_id in accepted_ids
         reason = decision.reason
         if decision.accepted and not accepted:
@@ -218,6 +380,10 @@ def apply_benjamini_hochberg(
             reason = f"{reason}; bh_accept"
         corrected.append(replace(decision, accepted=accepted, reason=reason))
     return corrected
+
+
+def _is_cleanup(decision: GateDecision) -> bool:
+    return decision.reason.startswith(PARETO_CLEANUP_REASON)
 
 
 def exact_mcnemar_one_sided(
@@ -316,6 +482,7 @@ def _reason(
 
 
 __all__ = [
+    "PARETO_CLEANUP_REASON",
     "AcceptanceGateConfig",
     "PairedBootstrapAcceptanceGate",
     "PairedTestResult",
@@ -323,4 +490,5 @@ __all__ = [
     "exact_mcnemar_one_sided",
     "paired_differences",
     "paired_test",
+    "secondary_metric_gains",
 ]

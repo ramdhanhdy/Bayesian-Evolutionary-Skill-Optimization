@@ -139,7 +139,6 @@ def _pav_nondecreasing(y: np.ndarray) -> np.ndarray:
         return y
     values = y.copy()
     weights = np.ones(n)
-    idx = list(range(n + 1))  # block boundaries via index pointer
     # Iterative pooling.
     level_values: list[float] = []
     level_weights: list[float] = []

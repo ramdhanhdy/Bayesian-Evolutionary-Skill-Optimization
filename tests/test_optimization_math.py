@@ -3,8 +3,9 @@ from __future__ import annotations
 import pytest
 
 from beso.core.protocols import GateDecision
-from beso.core.types import EvaluationResult, SplitRole
+from beso.core.types import EvaluationResult, SplitRole, Trajectory
 from beso.optimization import (
+    PARETO_CLEANUP_REASON,
     AcceptanceGateConfig,
     PairedBootstrapAcceptanceGate,
     RegimeDetectorConfig,
@@ -94,6 +95,123 @@ def test_gate_uses_exact_mcnemar_for_small_binary_pairs() -> None:
     assert decision.accepted
     assert "exact_mcnemar" in decision.reason
     assert decision.p_value == pytest.approx(1 / 64)
+
+
+def _eval_with(candidate_id: str, scores: list[float], **kwargs) -> EvaluationResult:
+    return EvaluationResult(
+        candidate_id=candidate_id,
+        split=SplitRole.VALIDATION_GATE,
+        per_example_scores={f"ex_{i}": s for i, s in enumerate(scores)},
+        **kwargs,
+    )
+
+
+def test_gate_accepts_pareto_cleanup_when_tokens_drop_without_accuracy_loss() -> None:
+    parent = _eval_with("parent", [1.0] * 8, mean_cost_tokens=100.0)
+    candidate = _eval_with("cand", [1.0] * 8, mean_cost_tokens=60.0)
+    gate = PairedBootstrapAcceptanceGate(AcceptanceGateConfig(bootstrap_samples=256))
+
+    decision = gate.decide(candidate, parent)
+
+    assert decision.accepted
+    assert decision.reason.startswith(PARETO_CLEANUP_REASON)
+    assert "child_tokens" in decision.reason
+    assert decision.mean_diff == pytest.approx(0.0)
+
+
+def test_gate_does_not_cleanup_when_secondary_metrics_are_equal() -> None:
+    parent = _eval_with("parent", [1.0] * 8, mean_cost_tokens=100.0)
+    candidate = _eval_with("cand", [1.0] * 8, mean_cost_tokens=100.0)
+    gate = PairedBootstrapAcceptanceGate(AcceptanceGateConfig(bootstrap_samples=256))
+
+    decision = gate.decide(candidate, parent)
+
+    assert not decision.accepted
+    assert not decision.reason.startswith(PARETO_CLEANUP_REASON)
+
+
+def test_gate_does_not_cleanup_when_primary_metric_degrades() -> None:
+    parent = _eval_with("parent", [1.0] * 8, mean_cost_tokens=100.0)
+    candidate = _eval_with("cand", [1.0] * 7 + [0.0], mean_cost_tokens=10.0)
+    gate = PairedBootstrapAcceptanceGate(AcceptanceGateConfig(bootstrap_samples=256))
+
+    decision = gate.decide(candidate, parent)
+
+    assert not decision.accepted
+
+
+def test_gate_does_not_cleanup_when_paired_ci_cannot_establish_noninferiority() -> None:
+    parent = _eval_with(
+        "parent",
+        [1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0],
+        mean_cost_tokens=100.0,
+    )
+    candidate = _eval_with(
+        "cand",
+        [0.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0],
+        mean_cost_tokens=10.0,
+    )
+    gate = PairedBootstrapAcceptanceGate(
+        AcceptanceGateConfig(bootstrap_samples=1024, bootstrap_seed=2)
+    )
+
+    decision = gate.decide(candidate, parent)
+
+    assert decision.ci_low < 0.0
+    assert not decision.accepted
+    assert not decision.reason.startswith(PARETO_CLEANUP_REASON)
+
+
+def test_gate_does_not_cleanup_on_noisy_latency_point_estimate() -> None:
+    ids = [f"ex_{i}" for i in range(8)]
+    parent = _eval_with(
+        "parent",
+        [1.0] * 8,
+        trajectories=[
+            Trajectory(example_id=example_id, task_input="", latency_seconds=1.0)
+            for example_id in ids
+        ],
+        mean_latency_seconds=1.0,
+    )
+    candidate_latencies = [0.1, 0.1, 0.1, 0.1, 1.7, 1.7, 1.7, 1.7]
+    candidate = _eval_with(
+        "cand",
+        [1.0] * 8,
+        trajectories=[
+            Trajectory(
+                example_id=example_id,
+                task_input="",
+                latency_seconds=latency,
+            )
+            for example_id, latency in zip(ids, candidate_latencies)
+        ],
+        mean_latency_seconds=sum(candidate_latencies) / len(candidate_latencies),
+    )
+    gate = PairedBootstrapAcceptanceGate(
+        AcceptanceGateConfig(bootstrap_samples=1024, bootstrap_seed=2)
+    )
+
+    decision = gate.decide(candidate, parent)
+
+    assert not decision.accepted
+
+
+def test_benjamini_hochberg_preserves_pareto_cleanup_decisions() -> None:
+    decisions = [
+        GateDecision(
+            candidate_id="z1",
+            accepted=True,
+            p_value=1.0,
+            reason=f"{PARETO_CLEANUP_REASON}:child_tokens",
+        ),
+        GateDecision(candidate_id="z2", accepted=False, p_value=0.30, reason="reject"),
+    ]
+
+    corrected = apply_benjamini_hochberg(decisions, alpha=0.05)
+
+    assert corrected[0].accepted
+    assert corrected[0].reason == f"{PARETO_CLEANUP_REASON}:child_tokens"
+    assert not corrected[1].accepted
 
 
 def test_benjamini_hochberg_rejects_borderline_batch_winner() -> None:

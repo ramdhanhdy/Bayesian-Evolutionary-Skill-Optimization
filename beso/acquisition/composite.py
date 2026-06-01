@@ -11,6 +11,7 @@ from beso.acquisition.base import (
     build_pool_statistics,
     candidate_cost,
     candidate_invalid_risk,
+    clip_to_bounds,
     compose_acquisition_score,
     prediction_terms,
 )
@@ -83,6 +84,7 @@ class PoolNormalizedBESOAcquisition:
         archive: Sequence[ArchiveEntry],
     ) -> AcquisitionTerms:
         mu, sigma = prediction_terms(prediction)
+        mu = clip_to_bounds(mu, self.config.metric_bounds)
         return AcquisitionTerms(
             mu=mu,
             sigma=sigma,

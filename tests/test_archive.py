@@ -112,3 +112,48 @@ def test_pareto_front_keeps_tradeoff_candidate() -> None:
     front = pareto_front(entries)
 
     assert {entry.candidate_id for entry in front} == {"high_quality", "low_cost"}
+
+
+def test_cleanup_entry_cannot_evict_deployable_incumbent_under_tight_cap() -> None:
+    archive = EvolutionaryArchive(
+        ArchiveConfig(
+            max_size=1,
+            top_by_validation=1,
+            top_by_pareto=1,
+            top_by_diversity=1,
+            top_failed_informative=0,
+        )
+    )
+    incumbent = _candidate("a_incumbent", "stable", 1.0)
+    cleanup = _candidate("z_cleanup", "stable but cheaper", 2.0)
+
+    archive.update([incumbent], [_eval("a_incumbent", {"a": 1.0})])
+    archive.update(
+        [cleanup],
+        [_eval("z_cleanup", {"a": 1.0})],
+        cleanup_ids=["z_cleanup"],
+    )
+
+    assert archive.best() is not None
+    assert archive.best().candidate_id == "a_incumbent"
+    assert [entry.candidate_id for entry in archive.entries()] == ["a_incumbent"]
+
+
+def test_cleanup_entry_with_raw_score_increase_stays_archive_only() -> None:
+    archive = EvolutionaryArchive()
+    incumbent = _candidate("incumbent", "stable", 1.0)
+    cleanup = _candidate("cleanup", "cheaper experiment", 2.0)
+
+    archive.update([incumbent], [_eval("incumbent", {"a": 0.0, "b": 1.0})])
+    archive.update(
+        [cleanup],
+        [_eval("cleanup", {"a": 1.0, "b": 1.0})],
+        cleanup_ids=["cleanup"],
+    )
+
+    assert archive.best() is not None
+    assert archive.best().candidate_id == "incumbent"
+    assert {entry.candidate_id for entry in archive.entries()} == {
+        "cleanup",
+        "incumbent",
+    }

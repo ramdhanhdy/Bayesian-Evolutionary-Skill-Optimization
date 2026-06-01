@@ -44,12 +44,23 @@ class EvolutionaryArchive:
         self._entries: dict[str, ArchiveEntry] = {}
         self._features: dict[str, CandidateFeatures] = {}
         self._evals: dict[str, EvaluationResult] = {}
+        # Candidate ids accepted as Pareto "cleanup" edits (non-inferior on the
+        # primary metric, better on a secondary one). They are routed to the
+        # pareto/diverse tiers and never become deployable ``best`` entries
+        # through the cleanup path alone (TICKET-004).
+        self._cleanup_ids: set[str] = set()
 
     def update(
         self,
         candidates: Sequence[Candidate],
         evals: Sequence[EvaluationResult],
+        *,
+        cleanup_ids: Sequence[str] | None = None,
     ) -> None:
+        incoming_ids = {candidate.candidate_id for candidate in candidates}
+        cleanup_set = set(cleanup_ids or ())
+        self._cleanup_ids -= incoming_ids - cleanup_set
+        self._cleanup_ids |= cleanup_set
         eval_by_id = {ev.candidate_id: ev for ev in evals}
         for candidate in candidates:
             ev = eval_by_id.get(candidate.candidate_id)
@@ -88,7 +99,22 @@ class EvolutionaryArchive:
         ]
         if not pool:
             return None
-        return max(pool, key=_entry_rank_key)
+        eligible = self._best_eligible(pool)
+        return max(eligible, key=_entry_rank_key) if eligible else None
+
+    def _best_eligible(self, pool: Sequence[ArchiveEntry]) -> list[ArchiveEntry]:
+        """Pool of entries allowed to be the deployable best.
+
+        Cleanup edits are archive-only until they separately pass the normal
+        primary gate. A raw validation increase is insufficient because it may
+        be a winner's-curse fluctuation (TICKET-004).
+        """
+
+        return [
+            entry
+            for entry in pool
+            if entry.candidate_id not in self._cleanup_ids
+        ]
 
     def entries(self) -> list[ArchiveEntry]:
         return sorted(self._entries.values(), key=lambda e: e.candidate_id)
@@ -147,7 +173,8 @@ class EvolutionaryArchive:
         viable = [e for e in entries if e.tier is not ArchiveTier.FAILED]
 
         keep: dict[str, ArchiveEntry] = {}
-        for entry in sorted(viable, key=_entry_rank_key, reverse=True)[
+        best_pool = self._best_eligible(viable)
+        for entry in sorted(best_pool, key=_entry_rank_key, reverse=True)[
             : self.config.top_by_validation
         ]:
             entry.tier = ArchiveTier.BEST
@@ -175,10 +202,29 @@ class EvolutionaryArchive:
             entry.tier = ArchiveTier.FAILED
             keep[entry.candidate_id] = entry
 
+        incumbent = (
+            max(best_pool, key=_entry_rank_key)
+            if best_pool
+            else None
+        )
+        if incumbent is not None:
+            incumbent.tier = ArchiveTier.BEST
+            keep[incumbent.candidate_id] = incumbent
+
         if len(keep) > self.config.max_size:
-            retained = sorted(keep.values(), key=_entry_rank_key, reverse=True)[
-                : self.config.max_size
-            ]
+            retained = []
+            if incumbent is not None:
+                retained.append(incumbent)
+            retained.extend(
+                entry
+                for entry in sorted(
+                    keep.values(),
+                    key=_entry_rank_key,
+                    reverse=True,
+                )
+                if incumbent is None or entry.candidate_id != incumbent.candidate_id
+            )
+            retained = retained[: self.config.max_size]
             keep = {entry.candidate_id: entry for entry in retained}
 
         self._entries = keep
@@ -186,6 +232,7 @@ class EvolutionaryArchive:
             cid: features for cid, features in self._features.items() if cid in keep
         }
         self._evals = {cid: ev for cid, ev in self._evals.items() if cid in keep}
+        self._cleanup_ids = {cid for cid in self._cleanup_ids if cid in keep}
 
     def _diverse_subset(
         self,

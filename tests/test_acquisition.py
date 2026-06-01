@@ -93,6 +93,38 @@ def test_acquisition_directionality() -> None:
     assert scored[1].acquisition_score > scored[0].acquisition_score
 
 
+def test_metric_bounds_clip_prevents_out_of_bounds_mu_inflation() -> None:
+    # z2 and z3 are BOTH past the valid metric ceiling (1.0); only their
+    # (meaningless) magnitude differs. z1 is a legitimate in-bounds prediction.
+    def score_pool(bounds):
+        cands = [
+            _candidate("z1", "alpha", tokens=10.0, invalid=0.0),
+            _candidate("z2", "beta", tokens=10.0, invalid=0.0),
+            _candidate("z3", "gamma", tokens=10.0, invalid=0.0),
+        ]
+        preds = [
+            _prediction("z1", 0.5, 0.05),
+            _prediction("z2", 2.0, 0.05),
+            _prediction("z3", 1000.0, 0.05),
+        ]
+        acq = PoolNormalizedBESOAcquisition(
+            AcquisitionConfig(diversity_lambda=0.0, metric_bounds=bounds)
+        )
+        scored = acq.score_pool(cands, preds, archive=[])
+        return {c.candidate_id: float(c.acquisition_score) for c in scored}
+
+    # Unbounded: the absurd mu=1000 dominates mu=2 even though both exceed the
+    # real metric ceiling -> ranking is driven by a meaningless magnitude.
+    raw = score_pool(None)
+    assert raw["z3"] > raw["z2"]
+
+    # Bounded to (0, 1): both clip to 1.0, so the meaningless gap disappears and
+    # the two out-of-bounds candidates tie instead of one inflating the score.
+    bounded = score_pool((0.0, 1.0))
+    assert bounded["z2"] == pytest.approx(bounded["z3"], abs=1e-9)
+    assert bounded["z2"] > bounded["z1"]
+
+
 def test_submodular_batch_selector_updates_in_batch_novelty() -> None:
     c1 = _candidate("z1", "repeat repeat repeat")
     c2 = _candidate("z2", "repeat repeat repeat")

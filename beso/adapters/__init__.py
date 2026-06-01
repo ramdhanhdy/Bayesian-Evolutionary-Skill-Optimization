@@ -6,6 +6,9 @@ BESO depends only on ``beso.core.protocols`` interfaces.
 """
 
 from beso.adapters.skillopt import (
+    GSM8KMiniDatasetProvider,
+    ProposedEdit,
+    ReflectionOutput,
     SkillOptDatasetProvider,
     SkillOptEditApplicator,
     SkillOptEvaluator,
@@ -18,6 +21,9 @@ from beso.adapters.skillopt import (
 )
 
 __all__ = [
+    "GSM8KMiniDatasetProvider",
+    "ProposedEdit",
+    "ReflectionOutput",
     "SkillOptDatasetProvider",
     "SkillOptEditApplicator",
     "SkillOptEvaluator",
