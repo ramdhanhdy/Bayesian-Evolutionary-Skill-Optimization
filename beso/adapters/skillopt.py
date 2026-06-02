@@ -12,6 +12,7 @@ import json
 import random
 import re
 from collections.abc import Callable, Mapping, Sequence
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
@@ -43,6 +44,7 @@ SLOW_UPDATE_START = "<!-- SLOW_UPDATE_START -->"
 SLOW_UPDATE_END = "<!-- SLOW_UPDATE_END -->"
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$", re.MULTILINE)
 _GSM8K_FINAL_RE = re.compile(r"####\s*(-?[\d,]+(?:\.\d+)?)")
+_NUMERIC_ANSWER_RE = re.compile(r"-?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?")
 
 
 def llm_generate(prompt: str) -> str:
@@ -167,10 +169,25 @@ class GSM8KMiniDatasetProvider(SkillOptDatasetProvider):
         test_path: str | Path | None = None,
         limit_per_split: int | None = None,
     ) -> "GSM8KMiniDatasetProvider":
-        train = _load_gsm8k_rows(train_path, "train", limit_per_split)
-        validation = _load_gsm8k_rows(validation_path, "val", limit_per_split)
+        train = _load_gsm8k_rows(
+            train_path,
+            "train",
+            limit_per_split,
+            include_feedback=True,
+        )
+        validation = _load_gsm8k_rows(
+            validation_path,
+            "val",
+            limit_per_split,
+            include_feedback=False,
+        )
         test = (
-            _load_gsm8k_rows(test_path, "test", limit_per_split)
+            _load_gsm8k_rows(
+                test_path,
+                "test",
+                limit_per_split,
+                include_feedback=False,
+            )
             if test_path is not None
             else list(validation)
         )
@@ -194,11 +211,13 @@ class SkillOptHarness:
         llm: LLMGenerate | None = None,
         serializer: SkillOptSerializer | None = None,
         scorer: Callable[[str, dict[str, Any]], float] | None = None,
+        inject_skill: bool = True,
     ) -> None:
         self.dataset = dataset
         self.llm = llm or llm_generate
         self.serializer = serializer or SkillOptSerializer()
         self.scorer = scorer or exact_match_score
+        self.inject_skill = inject_skill
 
     def rollout(
         self,
@@ -206,7 +225,7 @@ class SkillOptHarness:
         example_ids: Sequence[str],
         seed: int,
     ) -> list[Trajectory]:
-        skill_markdown = self.serializer.render(skill)
+        skill_markdown = self.serializer.render(skill) if self.inject_skill else ""
         trajectories: list[Trajectory] = []
         for example_id in example_ids:
             item = self.dataset.item(str(example_id))
@@ -240,6 +259,11 @@ class SkillOptEditApplicator:
         updated = apply_markdown_edit(document, edit)
         child_id = edit.edit_id or f"{parent.skill_id}_edit"
         parsed = self.serializer.parse(updated, skill_id=child_id)
+        parent_sections = _parse_sections(document)
+        if _has_meaningful_section(
+            parent_sections, SkillSection.CORE_PROCEDURE
+        ) and not _has_meaningful_section(parsed.sections, SkillSection.CORE_PROCEDURE):
+            return parent
         parsed.name = parent.name
         parsed.version = parent.version + 1
         parsed.metadata.parent_id = parent.skill_id
@@ -471,15 +495,15 @@ def apply_markdown_edit(markdown: str, edit: EditProposal) -> str:
     if target and _is_in_slow_update_region(markdown, target):
         return markdown
     if op is EditOperation.APPEND:
-        return _append(markdown, content)
+        return _append_to_section(markdown, edit.target_section, content)
     if op is EditOperation.INSERT_AFTER:
-        return _insert_after(markdown, target, content)
+        return _insert_after(markdown, target, content, edit.target_section)
     if op is EditOperation.REPLACE:
         return _replace(markdown, target, content, edit.target_section)
     if op is EditOperation.DELETE:
         return _delete(markdown, target, edit.target_section)
     if op is EditOperation.MERGE:
-        return _append(markdown, content)
+        return _append_to_section(markdown, edit.target_section, content)
     return markdown
 
 
@@ -493,6 +517,24 @@ def exact_match_score(output: str, item: Mapping[str, Any]) -> float:
     return 1.0 if any(normalized == _normalize_answer(ans) for ans in expected) else 0.0
 
 
+def gsm8k_numeric_score(output: str, item: Mapping[str, Any]) -> float:
+    """Score a GSM8K completion by its final numeric answer.
+
+    GSM8K references use ``#### final``. Model completions may use that marker
+    or provide a derivation followed by the answer, so the fallback extracts
+    the last numeric value.
+    """
+
+    predicted = _extract_final_numeric_answer(output)
+    if predicted is None:
+        return 0.0
+    for answer in _expected_answers(item):
+        expected = _extract_final_numeric_answer(answer)
+        if expected is not None and _numeric_answers_equal(predicted, expected):
+            return 1.0
+    return 0.0
+
+
 def _append(markdown: str, content: str) -> str:
     su_start = markdown.find(SLOW_UPDATE_START)
     if su_start != -1:
@@ -502,9 +544,32 @@ def _append(markdown: str, content: str) -> str:
     return markdown.rstrip() + "\n\n" + content + "\n"
 
 
-def _insert_after(markdown: str, target: str, content: str) -> str:
-    if not target or target not in markdown:
+def _append_to_section(
+    markdown: str,
+    section: SkillSection | None,
+    content: str,
+) -> str:
+    """Append content within a named section, creating it if needed."""
+
+    if section is None or _starts_with_heading(content):
         return _append(markdown, content)
+    span = _section_span(markdown, section)
+    if span is None:
+        return _append(markdown, f"## {_section_title(section)}\n{content}")
+    _, _, _, section_end = span
+    before = markdown[:section_end].rstrip()
+    after = markdown[section_end:].lstrip("\n")
+    return _join_markdown_blocks(before, content, after)
+
+
+def _insert_after(
+    markdown: str,
+    target: str,
+    content: str,
+    section: SkillSection | None,
+) -> str:
+    if not target or target not in markdown:
+        return _append_to_section(markdown, section, content)
     idx = markdown.index(target) + len(target)
     newline = markdown.find("\n", idx)
     insert_at = newline + 1 if newline != -1 else len(markdown)
@@ -518,11 +583,15 @@ def _replace(
     section: SkillSection | None,
 ) -> str:
     if target:
-        if target in markdown:
-            return markdown.replace(target, content, 1)
         line_replaced = _replace_fuzzy_line(markdown, target, content)
         if line_replaced is not None:
             return line_replaced
+        if (
+            target in markdown
+            and not _starts_with_heading(target)
+            and not _target_overlaps_heading(markdown, target)
+        ):
+            return markdown.replace(target, content, 1)
     if section is not None:
         return _replace_section(markdown, section, content)
     return markdown
@@ -534,11 +603,15 @@ def _delete(
     section: SkillSection | None,
 ) -> str:
     if target:
-        if target in markdown:
-            return markdown.replace(target, "", 1)
         line_deleted = _replace_fuzzy_line(markdown, target, "")
         if line_deleted is not None:
             return line_deleted
+        if (
+            target in markdown
+            and not _starts_with_heading(target)
+            and not _target_overlaps_heading(markdown, target)
+        ):
+            return markdown.replace(target, "", 1)
     if section is not None:
         return _replace_section(markdown, section, "")
     return markdown
@@ -554,6 +627,8 @@ def _replace_fuzzy_line(
         return None
     parts = markdown.splitlines(keepends=True)
     for idx, line in enumerate(parts):
+        if _HEADING_RE.match(line.rstrip("\n")):
+            continue
         line_key = _line_match_key(line)
         if not line_key:
             continue
@@ -612,6 +687,10 @@ def _section_span(
 
 def _starts_with_heading(text: str) -> bool:
     return bool(_HEADING_RE.match(text.strip()))
+
+
+def _target_overlaps_heading(markdown: str, target: str) -> bool:
+    return any(target in match.group(0) for match in _HEADING_RE.finditer(markdown))
 
 
 def _join_markdown_blocks(*blocks: str) -> str:
@@ -682,6 +761,15 @@ def _render_section_value(value: Any) -> str:
     return str(value).strip()
 
 
+def _has_meaningful_section(
+    sections: Mapping[SkillSection, Any],
+    section: SkillSection,
+) -> bool:
+    value = _render_section_value(sections.get(section, ""))
+    without_empty_markers = re.sub(r"(?m)^\s*[-*+]\s*$", "", value)
+    return bool(without_empty_markers.strip())
+
+
 def _load_items(split_path: Path) -> list[dict[str, Any]]:
     if not split_path.exists():
         return []
@@ -705,6 +793,8 @@ def _load_gsm8k_rows(
     path: str | Path,
     split_name: str,
     limit: int | None,
+    *,
+    include_feedback: bool,
 ) -> list[dict[str, Any]]:
     source = Path(path)
     rows: list[dict[str, Any]] = []
@@ -716,14 +806,14 @@ def _load_gsm8k_rows(
         match = _GSM8K_FINAL_RE.search(answer)
         if match is None:
             raise ValueError(f"{source}:{idx + 1} missing GSM8K '#### final' answer")
-        rows.append(
-            {
-                "id": str(raw.get("id") or f"gsm8k_{split_name}_{idx}"),
-                "question": str(raw.get("question", "")),
-                "answers": [match.group(1).replace(",", "")],
-                "feedback": answer,
-            }
-        )
+        row = {
+            "id": str(raw.get("id") or f"gsm8k_{split_name}_{idx}"),
+            "question": str(raw.get("question", "")),
+            "answers": [match.group(1).replace(",", "")],
+        }
+        if include_feedback:
+            row["feedback"] = answer
+        rows.append(row)
         if limit is not None and len(rows) >= limit:
             break
     return rows
@@ -752,11 +842,28 @@ def _expected_answers(item: Mapping[str, Any]) -> list[str]:
 
 
 def _compile_prompt(skill_markdown: str, task_input: str) -> str:
-    return f"{skill_markdown.rstrip()}\n\n## Task\n{task_input}\n"
+    skill_prefix = f"{skill_markdown.rstrip()}\n\n" if skill_markdown.strip() else ""
+    return f"{skill_prefix}## Task\n{task_input}\n"
 
 
 def _normalize_answer(text: str) -> str:
     return re.sub(r"\s+", " ", str(text).strip().lower())
+
+
+def _extract_final_numeric_answer(text: str) -> str | None:
+    text = str(text)
+    candidate = text.rsplit("####", 1)[-1] if "####" in text else text
+    matches = _NUMERIC_ANSWER_RE.findall(candidate)
+    if not matches:
+        return None
+    return matches[-1].replace(",", "")
+
+
+def _numeric_answers_equal(left: str, right: str) -> bool:
+    try:
+        return Decimal(left) == Decimal(right)
+    except InvalidOperation:
+        return False
 
 
 def _invalid_rate(trajectories: Sequence[Trajectory]) -> float:
@@ -1060,5 +1167,6 @@ __all__ = [
     "SkillOptSerializer",
     "apply_markdown_edit",
     "exact_match_score",
+    "gsm8k_numeric_score",
     "llm_generate",
 ]

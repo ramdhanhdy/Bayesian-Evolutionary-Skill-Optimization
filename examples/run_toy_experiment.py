@@ -29,6 +29,7 @@ Optional environment:
 from __future__ import annotations
 
 import os
+from collections.abc import Callable
 from pathlib import Path
 from typing import Sequence
 
@@ -39,6 +40,7 @@ from beso.acquisition import (
     BatchSelectionConfig,
     GreedySubmodularBatchSelector,
     PoolNormalizedBESOAcquisition,
+    clip_to_bounds,
 )
 from beso.adapters import (
     SkillOptDatasetProvider,
@@ -177,12 +179,17 @@ Hard requirements:
     directly explains failures, include multiple replace/delete edits that
     target that exact rule or its full section. Prefer replacing the faulty
     core_procedure over merely appending advice.
+14. The total skill artifact is allowed to grow. When evidence supports it,
+    propose comprehensive multi-rule additions, worked examples, recovery
+    guidance, and structured sections. The 500-token limit applies per edit,
+    not to the full evolved artifact.
 """
 
-TARGET_SYSTEM_INSTRUCTION = """You are executing a toy benchmark with a supplied skill.
-Follow the skill unless it is clearly self-contradictory with the task.
-For arithmetic tasks, compute carefully and return only the final integer.
-Do not include explanation, units, or punctuation.
+TARGET_SYSTEM_INSTRUCTION = """You are executing a benchmark with a supplied skill.
+Use only the supplied skill's procedure to solve the task.
+Do not introduce a procedure that is not stated in the skill.
+If the skill does not provide enough guidance to derive an answer, return 0.
+Return only the final answer. Do not include explanation, units, or punctuation.
 """
 
 INITIAL_SKILL = """# Skill: Toy Arithmetic
@@ -232,12 +239,17 @@ class LoggingBESOOptimizer(BESOOptimizer):
             reverse=True,
         )[:8]:
             pred = candidate.prediction
-            mu = pred.mu if pred is not None else float("nan")
+            mu_raw = pred.mu if pred is not None else float("nan")
+            mu_bounded = clip_to_bounds(
+                mu_raw,
+                self.acquisition.config.metric_bounds,
+            )
             sigma = pred.sigma if pred is not None else float("nan")
             acq = float(candidate.acquisition_score or 0.0)
             print(
                 f"  {candidate.candidate_id}: "
-                f"mu={mu:.3f} sigma={sigma:.3f} acq={acq:.3f}"
+                f"mu_raw={mu_raw:.3f} mu_bounded={mu_bounded:.3f} "
+                f"sigma={sigma:.3f} acq={acq:.3f}"
             )
         return use_surrogate, reason
 
@@ -523,9 +535,13 @@ def build_optimizer(
     dataset: SkillOptDatasetProvider | None = None,
     *,
     trace_path: str | Path = TRACE_PATH,
+    target_generate: Callable[[str], str] = target_llm,
+    scorer: Callable[[str, dict], float] = numeric_exact_score,
+    feedback_batch_size: int | None = None,
+    harness: SkillOptHarness | None = None,
 ) -> LoggingBESOOptimizer:
     dataset = dataset or SkillOptDatasetProvider(items_by_role=toy_dataset())
-    harness = SkillOptHarness(dataset, llm=target_llm, scorer=numeric_exact_score)
+    harness = harness or SkillOptHarness(dataset, llm=target_generate, scorer=scorer)
     evaluator = SkillOptEvaluator(harness)
     archive = EvolutionaryArchive(
         ArchiveConfig(
@@ -534,13 +550,16 @@ def build_optimizer(
             top_by_pareto=4,
             top_by_diversity=4,
             top_failed_informative=4,
+            parent_cost_beta=float(
+                env_value("BESO_PARENT_COST_BETA", default="0.02")
+            ),
         )
     )
     acquisition = PoolNormalizedBESOAcquisition(
         AcquisitionConfig(
             kappa=1.5,
             diversity_lambda=0.2,
-            cost_alpha=0.05,
+            cost_alpha=float(env_value("BESO_COST_ALPHA", default="0.01")),
             metric_bounds=(0.0, 1.0),
         ),
         feature_lookup=archive.feature_lookup,
@@ -593,6 +612,11 @@ def build_optimizer(
             parent_count=1,
             optimization_batch_size=int(
                 env_value("BESO_OPTIMIZATION_BATCH_SIZE", default="3")
+            ),
+            feedback_batch_size=(
+                int(env_value("BESO_FEEDBACK_BATCH_SIZE", default="3"))
+                if feedback_batch_size is None
+                else feedback_batch_size
             ),
             validation_batch_size=int(
                 env_value("BESO_VALIDATION_BATCH_SIZE", default="10")

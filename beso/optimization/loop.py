@@ -59,6 +59,7 @@ class BESOOptimizerConfig:
     batch_size: int = 2
     parent_count: int = 1
     optimization_batch_size: int = 8
+    feedback_batch_size: int = 0
     validation_batch_size: int = 8
     seed: int = 0
     fallback_strategy: str = "random"
@@ -75,6 +76,8 @@ class BESOOptimizerConfig:
             raise ValueError("parent_count must be positive")
         if self.optimization_batch_size <= 0:
             raise ValueError("optimization_batch_size must be positive")
+        if self.feedback_batch_size < 0:
+            raise ValueError("feedback_batch_size must be non-negative")
         if self.validation_batch_size <= 0:
             raise ValueError("validation_batch_size must be positive")
         if self.fallback_strategy not in {"random", "greedy"}:
@@ -195,6 +198,17 @@ class BESOOptimizer:
             )
             self.features[seed_candidate.candidate_id] = seed_candidate.features
             self.archive.update([seed_candidate], [seed_eval])
+
+        if self.config.feedback_batch_size > 0 and not budget.exhausted:
+            feedback_eval = self._evaluate_with_budget(
+                initial_skill,
+                SplitRole.FEEDBACK_TRAIN,
+                self.config.feedback_batch_size,
+                self.config.seed,
+                budget,
+            )
+            if feedback_eval is not None:
+                self._remember_evaluation(seed_candidate, feedback_eval)
 
         for iteration in range(self.config.max_iterations):
             if budget.exhausted:
@@ -578,7 +592,11 @@ class BESOOptimizer:
                 split=ev.split,
             )
         )
-        self.trajectories[candidate.candidate_id] = list(ev.trajectories)
+        if ev.split in {
+            SplitRole.FEEDBACK_TRAIN,
+            SplitRole.OPTIMIZATION_MINIBATCH,
+        }:
+            self.trajectories[candidate.candidate_id] = list(ev.trajectories)
 
     def _parent_artifact(
         self,
@@ -633,7 +651,7 @@ def _fallback_repair_priority(candidate: Candidate) -> float:
         score += 1.0
 
     if edit.target_section is SkillSection.CORE_PROCEDURE:
-        score += 3.0
+        score += 8.0
     elif edit.target_section in {
         SkillSection.RECOVERY_RULES,
         SkillSection.VERIFICATION_CHECKLIST,
@@ -656,12 +674,14 @@ def _fallback_repair_priority(candidate: Candidate) -> float:
             edit.expected_effect,
         ]
     ).lower()
-    if "return 0" in evidence or "do not recalculate" in evidence:
-        score += 8.0
+    if "return 0" in evidence:
+        score += 10.0
+    if "do not recalculate" in evidence:
+        score += 4.0
 
     document = candidate.skill.document.lower()
-    if "return 0 for every question" not in document:
-        score += 8.0
+    if "return 0" not in document:
+        score += 16.0
     elif edit.operation is EditOperation.APPEND:
         score -= 1.0
 

@@ -103,6 +103,10 @@ During execution, you will see a detailed trace of the iterations:
 - **Iteration 2+**: The surrogate fits on historical features and guides candidate selection. The acquisition logs show predicted values (`mu`, `sigma`) and composite scores.
 - **Run Summary**: Prints the final optimized skill artifact and performance history.
 
+For a comprehensive, step-by-step guide on how to interpret each component of these logs (including the hypothesis testing, Benjamini-Hochberg correction, active learning acquisition scores, and the regime detector), see the detailed guide in `@/2026/Bayesian Evolutionary Skill Optimization/docs/experiments/results/M1-toy-validation.md`.
+
+---
+
 ## Local GSM8K Mini Experiment
 
 `run_gsm8k_mini_experiment.py` reuses the same optimizer and LiteLLM adapters
@@ -112,6 +116,29 @@ against local standard GSM8K JSONL rows. Each row must contain `question` and
 ```bash
 export BESO_GSM8K_TRAIN_JSONL=path/to/train.jsonl
 export BESO_GSM8K_VALIDATION_JSONL=path/to/validation.jsonl
+export BESO_GSM8K_TEST_JSONL=path/to/test.jsonl
 export BESO_GSM8K_LIMIT=32
+export BESO_FEEDBACK_BATCH_SIZE=8
+export BESO_GSM8K_TARGET_MAX_TOKENS=2048
+export BESO_GSM8K_BESO_SEED=minimal
 uv run python examples/run_gsm8k_mini_experiment.py
 ```
+
+The GSM8K runner reports three distinct conditions on one deterministic
+validation draw:
+
+1. `literal_no_skill`: the harness omits skill injection entirely.
+2. `minimal_seed`: the frozen model receives only a neutral goal and numeric
+   output rule.
+3. `BESO`: the optimizer evolves the minimal seed under its configured rollout
+   budget.
+
+Set `BESO_GSM8K_BESO_SEED=toxic` only for a diagnostic recovery run. The two
+frozen baselines still run unchanged. Baseline validation calls are reported
+separately from BESO's optimization budget, and the comparison record is
+written beside the main trace as `*_conditions.jsonl`.
+
+Reflection receives worked solutions from the training feedback split only.
+Validation and test answers remain hidden from the proposer. GSM8K scoring
+extracts the final numeric answer, allowing natural-language reasoning output
+without treating correct answers as formatting failures.

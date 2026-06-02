@@ -17,6 +17,7 @@ from beso.adapters.skillopt import (
     SkillOptSerializer,
     apply_markdown_edit,
     exact_match_score,
+    gsm8k_numeric_score,
     llm_generate,
 )
 
@@ -32,5 +33,6 @@ __all__ = [
     "SkillOptSerializer",
     "apply_markdown_edit",
     "exact_match_score",
+    "gsm8k_numeric_score",
     "llm_generate",
 ]

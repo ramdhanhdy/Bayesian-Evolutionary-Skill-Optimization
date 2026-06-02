@@ -86,6 +86,21 @@ class FakeProposer:
         return edits[:pool_size]
 
 
+class RecordingProposer(FakeProposer):
+    def __init__(self) -> None:
+        self.trajectory_ids: list[str] = []
+
+    def propose_pool(
+        self,
+        parent: SkillArtifact,
+        trajectories: Sequence[Trajectory],
+        rejected: Sequence[EditProposal],
+        pool_size: int,
+    ) -> list[EditProposal]:
+        self.trajectory_ids = [trajectory.example_id for trajectory in trajectories]
+        return super().propose_pool(parent, trajectories, rejected, pool_size)
+
+
 class FakeApplicator:
     def apply(self, parent: SkillArtifact, edit: EditProposal) -> SkillArtifact:
         pred = 0.8 if edit.edit_id == "z_good" else 0.2
@@ -197,7 +212,12 @@ class ToggleRegime:
         return self.enabled
 
 
-def _optimizer(regime_enabled: bool = True, logger=None):
+def _optimizer(
+    regime_enabled: bool = True,
+    logger=None,
+    *,
+    feedback_batch_size: int = 0,
+):
     archive = EvolutionaryArchive(
         ArchiveConfig(
             max_size=8,
@@ -228,6 +248,7 @@ def _optimizer(regime_enabled: bool = True, logger=None):
             candidate_pool_size=2,
             batch_size=1,
             optimization_batch_size=1,
+            feedback_batch_size=feedback_batch_size,
             validation_batch_size=1,
             seed=11,
             fallback_strategy="greedy",
@@ -271,6 +292,20 @@ def test_optimizer_regime_fallback_bypasses_bayesian_math() -> None:
     assert acquisition.calls == 0
     assert selector.calls == 0
     assert regime.calls == 1
+
+
+def test_optimizer_reflection_uses_feedback_split_not_validation_gate() -> None:
+    opt, _, _, _, _ = _optimizer(regime_enabled=False, feedback_batch_size=2)
+    proposer = RecordingProposer()
+    opt.proposer = proposer
+    initial = SkillArtifact(skill_id="z0", name="seed", document="seed")
+
+    opt.optimize(initial, RolloutBudget(max_rollouts=8))
+
+    assert len(proposer.trajectory_ids) == 2
+    assert all(
+        example_id.startswith("feedback_train_") for example_id in proposer.trajectory_ids
+    )
 
 
 class PoisonRepairProposer:

@@ -10,6 +10,7 @@ from beso.adapters import (
     SkillOptHarness,
     SkillOptReflectionProposer,
     SkillOptSerializer,
+    gsm8k_numeric_score,
 )
 from beso.core import protocols as P
 from beso.core.types import (
@@ -208,6 +209,169 @@ def test_delete_uses_normalized_line_match_when_target_is_not_exact() -> None:
     assert "- Keep answers concise." in child.document
 
 
+def test_delete_rejects_empty_core_procedure() -> None:
+    applicator = SkillOptEditApplicator()
+    parent = SkillArtifact(
+        skill_id="z0",
+        name="Toy",
+        document=(
+            "# Skill: Toy\n\n"
+            "## Core Procedure\n"
+            "- Return 0 for every question.\n\n"
+            "## Output Rules\n"
+            "- Return only one integer.\n"
+        ),
+    )
+
+    child = applicator.apply(
+        parent,
+        EditProposal(
+            edit_id="z1",
+            parent_skill_id="z0",
+            operation=EditOperation.DELETE,
+            target="Return 0 for every question.",
+            target_section=SkillSection.CORE_PROCEDURE,
+        ),
+    )
+
+    assert child is parent
+    assert "- Return 0 for every question." in child.document
+
+
+def test_delete_section_name_replaces_body_without_erasing_heading() -> None:
+    applicator = SkillOptEditApplicator()
+    parent = SkillArtifact(
+        skill_id="z0",
+        name="Toy",
+        document=(
+            "# Skill: Toy\n\n"
+            "## Core Procedure\n"
+            "- Compute the answer.\n\n"
+            "## Verification Checklist\n"
+            "- Recalculate the answer.\n\n"
+            "## Output Rules\n"
+            "- Return only one integer.\n"
+        ),
+    )
+
+    child = applicator.apply(
+        parent,
+        EditProposal(
+            edit_id="z1",
+            parent_skill_id="z0",
+            operation=EditOperation.DELETE,
+            target="verification_checklist",
+            target_section=SkillSection.VERIFICATION_CHECKLIST,
+        ),
+    )
+
+    assert "## Verification Checklist" in child.document
+    assert "- Recalculate the answer." not in child.document
+    assert "## Output Rules" in child.document
+
+
+def test_delete_exact_heading_preserves_document_structure() -> None:
+    applicator = SkillOptEditApplicator()
+    parent = SkillArtifact(
+        skill_id="z0",
+        name="Toy",
+        document=(
+            "# Skill: Toy\n\n"
+            "## Core Procedure\n"
+            "- Compute the answer.\n\n"
+            "## Verification Checklist\n"
+            "- Recalculate the answer.\n\n"
+            "## Output Rules\n"
+            "- Return only one integer.\n"
+        ),
+    )
+
+    child = applicator.apply(
+        parent,
+        EditProposal(
+            edit_id="z1",
+            parent_skill_id="z0",
+            operation=EditOperation.DELETE,
+            target="## Verification Checklist",
+            target_section=SkillSection.VERIFICATION_CHECKLIST,
+        ),
+    )
+
+    assert "## Verification Checklist" in child.document
+    assert "- Recalculate the answer." not in child.document
+    assert "## Output Rules" in child.document
+
+
+def test_delete_heading_text_preserves_document_structure() -> None:
+    applicator = SkillOptEditApplicator()
+    parent = SkillArtifact(
+        skill_id="z0",
+        name="Toy",
+        document=(
+            "# Skill: Toy\n\n"
+            "## Core Procedure\n"
+            "- Compute the answer.\n\n"
+            "## Verification Checklist\n"
+            "- Recalculate the answer.\n\n"
+            "## Output Rules\n"
+            "- Return only one integer.\n"
+        ),
+    )
+
+    child = applicator.apply(
+        parent,
+        EditProposal(
+            edit_id="z1",
+            parent_skill_id="z0",
+            operation=EditOperation.DELETE,
+            target="Verification Checklist",
+            target_section=SkillSection.VERIFICATION_CHECKLIST,
+        ),
+    )
+
+    assert "## Verification Checklist" in child.document
+    assert "## \n" not in child.document
+    assert "- Recalculate the answer." not in child.document
+
+
+def test_append_targets_existing_section_without_flattening_document() -> None:
+    applicator = SkillOptEditApplicator()
+    parent = SkillArtifact(skill_id="z0", name="Search QA", document=SKILL_MD)
+
+    child = applicator.apply(
+        parent,
+        EditProposal(
+            edit_id="z1",
+            parent_skill_id="z0",
+            operation=EditOperation.APPEND,
+            content="- Cite the source.",
+            target_section=SkillSection.CORE_PROCEDURE,
+        ),
+    )
+
+    assert child.document.index("- Cite the source.") < child.document.index(
+        "## Output Rules"
+    )
+
+
+def test_append_creates_missing_target_section() -> None:
+    applicator = SkillOptEditApplicator()
+    parent = SkillArtifact(skill_id="z0", name="Search QA", document=SKILL_MD)
+
+    child = applicator.apply(
+        parent,
+        EditProposal(
+            edit_id="z1",
+            parent_skill_id="z0",
+            operation=EditOperation.APPEND,
+            content="- Retry with a narrower query.",
+            target_section=SkillSection.RECOVERY_RULES,
+        ),
+    )
+
+    assert "## Recovery Rules\n- Retry with a narrower query." in child.document
+
+
 def test_dataset_harness_and_evaluator_return_exact_accuracy() -> None:
     provider = SkillOptDatasetProvider(
         items_by_role={
@@ -231,6 +395,34 @@ def test_dataset_harness_and_evaluator_return_exact_accuracy() -> None:
     assert result.mean_score == 0.5
     assert result.invalid_rate == 0.0
     assert all(t.compiled_prompt.startswith("# Skill: Geo") for t in result.trajectories)
+
+
+def test_harness_can_run_without_injecting_a_skill_document() -> None:
+    prompts: list[str] = []
+    provider = SkillOptDatasetProvider(
+        items_by_role={
+            SplitRole.VALIDATION_GATE: [
+                {"id": "q1", "question": "What is 2 + 3?", "answers": ["5"]},
+            ]
+        }
+    )
+    harness = SkillOptHarness(
+        provider,
+        llm=lambda prompt: prompts.append(prompt) or "5",
+        inject_skill=False,
+    )
+    evaluator = SkillOptEvaluator(harness)
+
+    result = evaluator.evaluate(
+        SkillArtifact(skill_id="no_skill", name="", document=""),
+        SplitRole.VALIDATION_GATE,
+        ["q1"],
+        seed=1,
+    )
+
+    assert result.mean_score == 1.0
+    assert prompts == ["## Task\nWhat is 2 + 3?\n"]
+    assert "# Skill:" not in result.trajectories[0].compiled_prompt
 
 
 def test_reflection_proposer_parses_json_edit_pool() -> None:
@@ -409,4 +601,15 @@ def test_gsm8k_mini_provider_loads_standard_jsonl(tmp_path) -> None:
     train_ids = provider.batch(SplitRole.OPTIMIZATION_MINIBATCH, size=1, seed=1)
     val_ids = provider.batch(SplitRole.VALIDATION_GATE, size=1, seed=1)
     assert provider.item(train_ids[0])["answers"] == ["5"]
+    assert provider.item(train_ids[0])["feedback"] == "Compute. #### 5"
     assert provider.item(val_ids[0])["answers"] == ["6"]
+    assert "feedback" not in provider.item(val_ids[0])
+
+
+def test_gsm8k_numeric_score_extracts_final_answer_from_reasoning() -> None:
+    item = {"answers": ["1,234"]}
+
+    assert gsm8k_numeric_score("The result is 1,234.", item) == 1.0
+    assert gsm8k_numeric_score("First 12, then 1234.0", item) == 1.0
+    assert gsm8k_numeric_score("Work shown. #### 1,234", item) == 1.0
+    assert gsm8k_numeric_score("The result is 1235.", item) == 0.0
