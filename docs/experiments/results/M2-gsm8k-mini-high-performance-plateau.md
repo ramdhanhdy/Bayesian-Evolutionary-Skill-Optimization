@@ -88,4 +88,3 @@ M2 protocol for:
 - rotating feedback minibatches;
 - exploration-archive admission separate from deployable promotion;
 - plateau detection and early stopping.
-

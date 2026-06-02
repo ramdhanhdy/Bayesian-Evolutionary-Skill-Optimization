@@ -297,6 +297,13 @@ def _litellm_model_name(model: str, provider: str) -> str:
     return model
 
 
+def _completion_temperature(model: str, temperature: float) -> float:
+    model_name = model.rsplit("/", 1)[-1].lower()
+    if model_name.startswith("gpt-5") and not model_name.startswith("gpt-5.1"):
+        return 1.0
+    return temperature
+
+
 def _api_key_for_provider(provider: str) -> str:
     if provider == "deepseek":
         return env_value(
@@ -350,7 +357,7 @@ def litellm_completion(
             {"role": "user", "content": prompt},
         ],
         "api_key": api_key,
-        "temperature": temperature,
+        "temperature": _completion_temperature(model, temperature),
         "max_tokens": max_tokens,
     }
     if json_mode:

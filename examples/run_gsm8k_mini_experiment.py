@@ -99,6 +99,19 @@ def _print_baseline_results(results) -> None:
         )
 
 
+def _print_condition_comparison(baseline_results, result) -> None:
+    print("\n=== Condition Comparison ===")
+    for item in baseline_results:
+        print(f"{item.name}: validation={item.evaluation.mean_score:.3f}")
+    if result.best is None:
+        print("beso: validation=none")
+        return
+    print(
+        f"beso: validation={result.best.validation_mean:.3f} "
+        f"best={result.best.candidate_id}"
+    )
+
+
 def _write_condition_trace(
     trace_path: Path,
     baseline_results,
@@ -123,6 +136,15 @@ def _write_condition_trace(
                     "invalid_rate": item.evaluation.invalid_rate,
                 }
                 for item in baseline_results
+            ]
+            + [
+                {
+                    "name": "beso",
+                    "candidate_id": best.candidate_id if best is not None else None,
+                    "validation_mean": (
+                        best.validation_mean if best is not None else None
+                    ),
+                }
             ],
             "beso": {
                 "seed_mode": seed_mode,
@@ -249,6 +271,7 @@ def main() -> None:
     )
     print(f"rollouts spent: {result.budget.spent_rollouts}")
     print(f"iterations: {len(result.iterations)}")
+    _print_condition_comparison(baseline_results, result)
     condition_trace = _write_condition_trace(
         trace_path,
         baseline_results,

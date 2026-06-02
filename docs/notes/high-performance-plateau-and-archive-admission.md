@@ -164,4 +164,3 @@ This note does not authorize:
 
 The next step is to turn the candidate design direction into an ADR after the
 exploration-archive semantics and evaluation protocol are specified precisely.
-
