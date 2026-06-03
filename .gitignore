@@ -13,3 +13,6 @@ data/gsm8k/*.jsonl
 \.venv
 \.ruff_cache
 AGENTS.md
+/docs/external_references/
+/docs/external_references-bib4llm/
+/docs/notes/*

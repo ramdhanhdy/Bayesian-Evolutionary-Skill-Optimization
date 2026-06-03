@@ -29,6 +29,8 @@ Optional environment:
 from __future__ import annotations
 
 import os
+import random
+import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Sequence
@@ -92,6 +94,45 @@ def load_dotenv_file(path: Path) -> None:
 
 load_dotenv_file(_PROJECT_ROOT / ".env")
 load_dotenv_file(Path.cwd() / ".env")
+
+
+class _LiteLLMRetryableResponseError(RuntimeError):
+    pass
+
+
+def _response_field(value: object, field: str) -> object:
+    if isinstance(value, dict):
+        return value.get(field)
+    return getattr(value, field, None)
+
+
+def _response_error_text(value: object) -> str:
+    error = _response_field(value, "error")
+    if error:
+        return str(error)
+    return ""
+
+
+def _validated_litellm_content(response: object) -> str:
+    choices = _response_field(response, "choices")
+    if not choices:
+        error_text = _response_error_text(response)
+        if error_text:
+            raise _LiteLLMRetryableResponseError(f"LiteLLM response included provider error: {error_text}")
+        raise RuntimeError("LiteLLM response did not include any choices")
+
+    choice = choices[0]
+    finish_reason = _response_field(choice, "finish_reason")
+    if str(finish_reason or "").lower() == "error":
+        error_text = _response_error_text(response)
+        detail = f": {error_text}" if error_text else ""
+        raise _LiteLLMRetryableResponseError(f"LiteLLM response finished with provider error{detail}")
+
+    message = _response_field(choice, "message")
+    content = _response_field(message, "content") if message is not None else None
+    if content is None or str(content).strip() == "":
+        raise _LiteLLMRetryableResponseError("LiteLLM response returned empty content")
+    return str(content)
 
 
 def env_value(*names: str, default: str = "") -> str:
@@ -284,13 +325,19 @@ def _provider_for_model(model: str) -> str:
         return "deepseek"
     if model.startswith("gpt-") or model.startswith("openai/"):
         return "openai"
+    if "/" in model:
+        parts = model.split("/", 1)
+        known_providers = {"openai", "deepseek", "openrouter", "azure", "anthropic", "cohere", "bedrock", "vertex_ai", "gemini", "groq", "together", "huggingface"}
+        if parts[0].lower() not in known_providers:
+            if env_value("OPENROUTER_API_KEY", "BESO_OPENROUTER_API_KEY"):
+                return "openrouter"
     return "generic"
 
 
 def _litellm_model_name(model: str, provider: str) -> str:
-    if provider == "deepseek" and "/" not in model:
+    if provider == "deepseek" and not model.startswith("deepseek/"):
         return f"deepseek/{model}"
-    if provider == "openrouter" and "/" not in model:
+    if provider == "openrouter" and not model.startswith("openrouter/"):
         return f"openrouter/{model}"
     if provider == "openai" and "/" not in model and not model.startswith("gpt-"):
         return f"openai/{model}"
@@ -338,6 +385,7 @@ def litellm_completion(
 
     try:
         import litellm
+        litellm.suppress_debug_info = True
     except ImportError as exc:
         raise RuntimeError("Install LiteLLM first: pip install litellm") from exc
 
@@ -360,6 +408,8 @@ def litellm_completion(
         "temperature": _completion_temperature(model, temperature),
         "max_tokens": max_tokens,
     }
+    if provider != "generic":
+        kwargs["custom_llm_provider"] = provider
     if json_mode:
         kwargs["response_format"] = {"type": "json_object"}
     api_base = env_value("BESO_LITELLM_API_BASE")
@@ -379,9 +429,57 @@ def litellm_completion(
     if headers:
         kwargs["extra_headers"] = headers
 
-    response = litellm.completion(**kwargs)
-    message = response["choices"][0]["message"]
-    return str(message.get("content") or "")
+    max_retries = int(env_value("BESO_LITELLM_MAX_RETRIES", default="5"))
+    initial_delay = float(env_value("BESO_LITELLM_INITIAL_DELAY", default="2.0"))
+    backoff_factor = float(env_value("BESO_LITELLM_BACKOFF_FACTOR", default="2.0"))
+
+    exceptions = getattr(litellm, "exceptions", None)
+    RateLimitError = getattr(exceptions, "RateLimitError", None)
+    APIConnectionError = getattr(exceptions, "APIConnectionError", None)
+    ServiceUnavailableError = getattr(exceptions, "ServiceUnavailableError", None)
+
+    catch_exceptions = tuple(
+        exc for exc in [RateLimitError, APIConnectionError, ServiceUnavailableError] if exc is not None
+    )
+
+    delay = initial_delay
+    for attempt in range(max_retries + 1):
+        try:
+            response = litellm.completion(**kwargs)
+            return _validated_litellm_content(response)
+        except Exception as e:
+            is_retryable = False
+            if isinstance(e, _LiteLLMRetryableResponseError):
+                is_retryable = True
+            elif catch_exceptions and isinstance(e, catch_exceptions):
+                is_retryable = True
+            else:
+                err_msg = str(e).lower()
+                status_code = getattr(e, "status_code", getattr(e, "http_status", None))
+                if (
+                    status_code in (429, 500, 502, 503, 504)
+                    or "429" in err_msg
+                    or "rate limit" in err_msg
+                    or "too many requests" in err_msg
+                    or "503" in err_msg
+                    or "service unavailable" in err_msg
+                    or "502" in err_msg
+                    or "bad gateway" in err_msg
+                ):
+                    is_retryable = True
+
+            if is_retryable and attempt < max_retries:
+                jitter = random.uniform(0, 0.5 * delay)
+                sleep_time = delay + jitter
+                print(
+                    f"LiteLLM call hit retryable error: {e}. "
+                    f"Retrying in {sleep_time:.2f} seconds (attempt {attempt + 1}/{max_retries})...",
+                    flush=True,
+                )
+                time.sleep(sleep_time)
+                delay *= backoff_factor
+            else:
+                raise e
 
 
 def target_llm(prompt: str) -> str:

@@ -7,3 +7,4 @@ record it as an ADR under `docs/decisions/`.
 ## Open Notes
 
 - [High-performance plateau and archive admission](high-performance-plateau-and-archive-admission.md)
+- [Agent assignments: high-performance plateau and archive admission](high-performance-plateau-agent-assignments.md)
