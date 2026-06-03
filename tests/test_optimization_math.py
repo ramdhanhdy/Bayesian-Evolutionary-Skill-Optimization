@@ -8,9 +8,11 @@ from beso.optimization import (
     PARETO_CLEANUP_REASON,
     AcceptanceGateConfig,
     PairedBootstrapAcceptanceGate,
+    PlateauDiagnosticConfig,
     RegimeDetectorConfig,
     VarianceRankRegimeDetector,
     apply_benjamini_hochberg,
+    diagnose_binary_validation_plateau,
     paired_differences,
     spearman_rank_correlation,
 )
@@ -233,6 +235,21 @@ def test_regime_detector_falls_back_on_low_variance() -> None:
     )
 
     assert not detector.use_surrogate(_DummySurrogate(True), [0.5, 0.5001, 0.4999])
+
+
+def test_binary_plateau_diagnostic_flags_31_of_32_dead_zone() -> None:
+    diagnostic = diagnose_binary_validation_plateau(
+        [1.0] * 31 + [0.0],
+        PlateauDiagnosticConfig(alpha=0.10, saturation_score=0.95),
+    )
+
+    assert diagnostic.saturated
+    assert diagnostic.validation_n == 32
+    assert diagnostic.current_mean == pytest.approx(31 / 32)
+    assert diagnostic.improvable_count == 1
+    assert diagnostic.best_possible_exact_mcnemar_p == pytest.approx(0.5)
+    assert not diagnostic.promotion_possible_under_exact_mcnemar
+    assert diagnostic.reason == "saturated_binary_validation_draw"
 
 
 def test_regime_detector_falls_back_on_poor_rank_correlation() -> None:

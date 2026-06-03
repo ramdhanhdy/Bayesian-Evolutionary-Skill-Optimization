@@ -5,7 +5,7 @@ from __future__ import annotations
 import difflib
 import inspect
 from dataclasses import dataclass, field
-from typing import Callable, Optional, Sequence
+from typing import Any, Callable, Optional, Sequence
 
 import numpy as np
 
@@ -231,9 +231,15 @@ class BESOOptimizer:
         iteration: int,
         budget: RolloutBudget,
     ) -> IterationRecord | None:
-        parents = self.archive.select_parents(self.config.parent_count, self._seed(iteration))
+        parent_seed = self._seed(iteration)
+        parents = self.archive.select_parents(self.config.parent_count, parent_seed)
         if not parents:
             return None
+        parent_selection = self._parent_selection_audit(
+            requested_parent_count=self.config.parent_count,
+            seed=parent_seed,
+            parents=parents,
+        )
 
         pool = self._build_candidate_pool(parents, iteration)
         if not pool:
@@ -293,10 +299,18 @@ class BESOOptimizer:
             for d in decisions
             if d.accepted and d.reason.startswith(PARETO_CLEANUP_REASON)
         }
+        admission_reasons = {
+            d.candidate_id: [d.reason] for d in decisions if d.accepted
+        }
         accepted = [c for c in selected if c.candidate_id in accepted_ids]
         accepted_evals = [val_evals[c.candidate_id] for c in accepted]
         if accepted:
-            self._archive_update(accepted, accepted_evals, cleanup_ids)
+            self._archive_update(
+                accepted,
+                accepted_evals,
+                cleanup_ids,
+                admission_reasons,
+            )
         for candidate in selected:
             if candidate.candidate_id in rejected_ids and candidate.edit is not None:
                 self.rejected_edits.append(candidate.edit)
@@ -320,6 +334,7 @@ class BESOOptimizer:
             pool=pool,
             selected=selected,
             parents=parents,
+            parent_selection=parent_selection,
             opt_evals=opt_evals,
             val_evals=val_evals,
             decisions=decisions,
@@ -334,6 +349,7 @@ class BESOOptimizer:
         pool: Sequence[Candidate],
         selected: Sequence[Candidate],
         parents: Sequence[ArchiveEntry],
+        parent_selection: dict[str, Any] | None,
         opt_evals: dict[str, EvaluationResult],
         val_evals: dict[str, EvaluationResult],
         decisions: Sequence[GateDecision],
@@ -364,7 +380,25 @@ class BESOOptimizer:
             "gate_decisions": list(decisions),
             "archive_snapshot": list(self.archive.entries()),
         }
+        if parent_selection is not None:
+            payload["parent_selection"] = parent_selection
         self.logger.log(payload)
+
+    def _parent_selection_audit(
+        self,
+        *,
+        requested_parent_count: int,
+        seed: int,
+        parents: Sequence[ArchiveEntry],
+    ) -> dict[str, Any] | None:
+        if self.logger is None or not hasattr(self.archive, "parent_selection_table"):
+            return None
+        table = getattr(self.archive, "parent_selection_table")
+        return table(
+            requested_parent_count,
+            seed,
+            selected_ids=[parent.candidate_id for parent in parents],
+        )
 
     def _candidate_diff(
         self,
@@ -387,20 +421,23 @@ class BESOOptimizer:
         accepted: Sequence[Candidate],
         accepted_evals: Sequence[EvaluationResult],
         cleanup_ids: set[str],
+        admission_reasons: dict[str, list[str]],
     ) -> None:
         """Update the archive, forwarding cleanup ids when supported."""
 
-        if cleanup_ids and self._archive_supports_cleanup():
-            self.archive.update(accepted, accepted_evals, cleanup_ids=cleanup_ids)
-        else:
-            self.archive.update(accepted, accepted_evals)
+        kwargs: dict[str, Any] = {}
+        if cleanup_ids and self._archive_supports_kwarg("cleanup_ids"):
+            kwargs["cleanup_ids"] = cleanup_ids
+        if admission_reasons and self._archive_supports_kwarg("admission_reasons"):
+            kwargs["admission_reasons"] = admission_reasons
+        self.archive.update(accepted, accepted_evals, **kwargs)
 
-    def _archive_supports_cleanup(self) -> bool:
+    def _archive_supports_kwarg(self, name: str) -> bool:
         try:
             params = inspect.signature(self.archive.update).parameters
         except (TypeError, ValueError):
             return False
-        return "cleanup_ids" in params
+        return name in params
 
     def _build_candidate_pool(
         self,

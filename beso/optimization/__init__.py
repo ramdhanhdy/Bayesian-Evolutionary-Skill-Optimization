@@ -25,8 +25,11 @@ from beso.optimization.loop import (
     OptimizationResult,
 )
 from beso.optimization.regime import (
+    PlateauDiagnostic,
+    PlateauDiagnosticConfig,
     RegimeDetectorConfig,
     VarianceRankRegimeDetector,
+    diagnose_binary_validation_plateau,
     spearman_rank_correlation,
 )
 
@@ -40,9 +43,12 @@ __all__ = [
     "OptimizationResult",
     "PairedBootstrapAcceptanceGate",
     "PairedTestResult",
+    "PlateauDiagnostic",
+    "PlateauDiagnosticConfig",
     "RegimeDetectorConfig",
     "VarianceRankRegimeDetector",
     "apply_benjamini_hochberg",
+    "diagnose_binary_validation_plateau",
     "exact_mcnemar_one_sided",
     "paired_differences",
     "paired_test",

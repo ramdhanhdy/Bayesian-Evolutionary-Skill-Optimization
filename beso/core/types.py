@@ -112,6 +112,15 @@ class ArchiveTier(str, Enum):
     FAILED = "failed"
 
 
+class ArchiveAdmissionMode(str, Enum):
+    """How an archive entry was admitted relative to deployable promotion."""
+
+    PROMOTION = "promotion"
+    ARCHIVE_EXPLORATION = "archive_exploration"
+    CLEANUP = "cleanup"
+    REJECT = "reject"
+
+
 # --------------------------------------------------------------------------- #
 # Skill artifact (the optimization target z)                                    #
 # --------------------------------------------------------------------------- #
@@ -336,6 +345,11 @@ class ArchiveEntry:
     known_weaknesses: list[str] = field(default_factory=list)
     accepted_edit_summary: str = ""
     created_at_iteration: int = 0
+    admission_mode: ArchiveAdmissionMode = ArchiveAdmissionMode.PROMOTION
+    deployable_eligible: bool = True
+    archive_parent_eligible: bool = True
+    admission_reasons: list[str] = field(default_factory=list)
+    best_exclusion_reason: str = ""
 
 
 # --------------------------------------------------------------------------- #

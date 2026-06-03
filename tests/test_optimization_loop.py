@@ -446,6 +446,7 @@ def test_jsonl_logger_writes_nested_iteration_payload(tmp_path) -> None:
         "evals",
         "gate_decisions",
         "archive_snapshot",
+        "parent_selection",
     ):
         assert key in payload
 
@@ -464,3 +465,11 @@ def test_jsonl_logger_writes_nested_iteration_payload(tmp_path) -> None:
     assert all("artifact" in row for row in payload["archive_snapshot"])
     # selected candidate diff is captured.
     assert "z_good" in payload["diffs"]
+    # parent-selection pressure is auditable from the same trace.
+    assert payload["parent_selection"]["requested_parent_count"] == 1
+    assert payload["parent_selection"]["selected_ids"] == ["z0"]
+    assert payload["parent_selection"]["eligible_count"] == 1
+    parent_rows = payload["parent_selection"]["eligible"]
+    assert parent_rows[0]["candidate_id"] == "z0"
+    assert parent_rows[0]["selected"]
+    assert "weighted_logit" in parent_rows[0]["terms"]

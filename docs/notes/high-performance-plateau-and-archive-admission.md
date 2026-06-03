@@ -353,3 +353,8 @@ This note does not authorize:
 
 The next step is to turn the candidate design direction into an ADR after the
 exploration-archive semantics and evaluation protocol are specified precisely.
+
+## Follow-Up
+
+The proposed decision record is
+[ADR 0001: Separate deployable promotion from exploration-archive admission under high-performance plateaus](../decisions/v0.0/0001-separate-deployable-promotion-from-exploration-archive-admission.md).

@@ -27,7 +27,7 @@ These are interfaces only; no concrete binding to SkillOpt symbols happens here.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Optional, Protocol, Sequence, runtime_checkable
+from typing import Any, Mapping, Optional, Protocol, Sequence, runtime_checkable
 
 from beso.core.types import (
     ArchiveEntry,
@@ -304,12 +304,30 @@ class Archive(Protocol):
     under a size cap (Breakdown S4.2, S10; Spec S15).
     """
 
-    def update(self, candidates: Sequence[Candidate], evals: Sequence[EvaluationResult]) -> None:
+    def update(
+        self,
+        candidates: Sequence[Candidate],
+        evals: Sequence[EvaluationResult],
+        *,
+        cleanup_ids: Sequence[str] | None = None,
+        exploration_ids: Sequence[str] | None = None,
+        admission_reasons: Mapping[str, Sequence[str]] | None = None,
+    ) -> None:
         """Incorporate newly evaluated candidates into the archive."""
         ...
 
     def select_parents(self, n: int, seed: int) -> list[ArchiveEntry]:
         """Sample parents by Pareto win-count + UCB-style score + diversity."""
+        ...
+
+    def parent_selection_table(
+        self,
+        n: int,
+        seed: int,
+        *,
+        selected_ids: Sequence[str] | None = None,
+    ) -> dict[str, Any]:
+        """Return the parent-selection probability table used for trace audits."""
         ...
 
     def best(self) -> Optional[ArchiveEntry]:
