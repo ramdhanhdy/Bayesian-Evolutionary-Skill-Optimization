@@ -12,8 +12,17 @@ import json
 import random
 import re
 from collections.abc import Callable, Mapping, Sequence
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
+
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from beso.core.types import (
     EditCategory,
@@ -34,6 +43,8 @@ TrajectoryScorer = Callable[[Trajectory], float]
 SLOW_UPDATE_START = "<!-- SLOW_UPDATE_START -->"
 SLOW_UPDATE_END = "<!-- SLOW_UPDATE_END -->"
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$", re.MULTILINE)
+_GSM8K_FINAL_RE = re.compile(r"####\s*(-?[\d,]+(?:\.\d+)?)")
+_NUMERIC_ANSWER_RE = re.compile(r"-?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?")
 
 
 def llm_generate(prompt: str) -> str:
@@ -146,6 +157,50 @@ class SkillOptDatasetProvider:
             self._items[role] = normalized
 
 
+class GSM8KMiniDatasetProvider(SkillOptDatasetProvider):
+    """Local JSONL adapter for deterministic GSM8K mini experiments."""
+
+    @classmethod
+    def from_jsonl(
+        cls,
+        train_path: str | Path,
+        validation_path: str | Path,
+        *,
+        test_path: str | Path | None = None,
+        limit_per_split: int | None = None,
+    ) -> "GSM8KMiniDatasetProvider":
+        train = _load_gsm8k_rows(
+            train_path,
+            "train",
+            limit_per_split,
+            include_feedback=True,
+        )
+        validation = _load_gsm8k_rows(
+            validation_path,
+            "val",
+            limit_per_split,
+            include_feedback=False,
+        )
+        test = (
+            _load_gsm8k_rows(
+                test_path,
+                "test",
+                limit_per_split,
+                include_feedback=False,
+            )
+            if test_path is not None
+            else list(validation)
+        )
+        return cls(
+            items_by_role={
+                SplitRole.FEEDBACK_TRAIN: train,
+                SplitRole.OPTIMIZATION_MINIBATCH: train,
+                SplitRole.VALIDATION_GATE: validation,
+                SplitRole.FINAL_TEST: test,
+            }
+        )
+
+
 class SkillOptHarness:
     """Minimal execution harness using an injectable LLM generator."""
 
@@ -156,11 +211,13 @@ class SkillOptHarness:
         llm: LLMGenerate | None = None,
         serializer: SkillOptSerializer | None = None,
         scorer: Callable[[str, dict[str, Any]], float] | None = None,
+        inject_skill: bool = True,
     ) -> None:
         self.dataset = dataset
         self.llm = llm or llm_generate
         self.serializer = serializer or SkillOptSerializer()
         self.scorer = scorer or exact_match_score
+        self.inject_skill = inject_skill
 
     def rollout(
         self,
@@ -168,7 +225,7 @@ class SkillOptHarness:
         example_ids: Sequence[str],
         seed: int,
     ) -> list[Trajectory]:
-        skill_markdown = self.serializer.render(skill)
+        skill_markdown = self.serializer.render(skill) if self.inject_skill else ""
         trajectories: list[Trajectory] = []
         for example_id in example_ids:
             item = self.dataset.item(str(example_id))
@@ -202,6 +259,11 @@ class SkillOptEditApplicator:
         updated = apply_markdown_edit(document, edit)
         child_id = edit.edit_id or f"{parent.skill_id}_edit"
         parsed = self.serializer.parse(updated, skill_id=child_id)
+        parent_sections = _parse_sections(document)
+        if _has_meaningful_section(
+            parent_sections, SkillSection.CORE_PROCEDURE
+        ) and not _has_meaningful_section(parsed.sections, SkillSection.CORE_PROCEDURE):
+            return parent
         parsed.name = parent.name
         parsed.version = parent.version + 1
         parsed.metadata.parent_id = parent.skill_id
@@ -260,17 +322,132 @@ class SkillOptEvaluator:
         )
 
 
+_EDIT_OP_ALIASES = {"add": "append", "remove": "delete"}
+
+
+class ProposedEdit(BaseModel):
+    """Schema-validated single reflection edit (TICKET-002).
+
+    Individual edits are bounded and operation-safe. Pool-level checks enforce
+    requested cardinality, distinctness, and trace-grounded metadata before a
+    completion is accepted.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    op: str
+    content: str = ""
+    target: str = ""
+    edit_id: str = ""
+    category: str | None = None
+    target_section: str | None = None
+    source_type: str | None = None
+    rationale: str = ""
+    expected_effect: str = ""
+    risk: str = ""
+    estimated_scope: str = ""
+    edit_size_tokens: int = 0
+
+    @field_validator("op", mode="before")
+    @classmethod
+    def _normalize_op(cls, value: object) -> str:
+        if value is None:
+            raise ValueError("edit 'op' is required")
+        raw = str(value).strip().lower()
+        raw = _EDIT_OP_ALIASES.get(raw, raw)
+        try:
+            EditOperation(raw)
+        except ValueError as exc:
+            raise ValueError(f"unknown edit op: {value!r}") from exc
+        return raw
+
+    @field_validator(
+        "content",
+        "target",
+        "edit_id",
+        "rationale",
+        "expected_effect",
+        "risk",
+        "estimated_scope",
+        mode="before",
+    )
+    @classmethod
+    def _coerce_optional_str(cls, value: object) -> str:
+        return "" if value is None else str(value)
+
+    @field_validator("edit_size_tokens", mode="before")
+    @classmethod
+    def _coerce_tokens(cls, value: object) -> int:
+        if value in (None, ""):
+            return 0
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return 0
+
+    @model_validator(mode="after")
+    def _validate_bounded_operation(self) -> "ProposedEdit":
+        if approx_tokens(self.content) > 500:
+            raise ValueError("edit content exceeds the 500-token ceiling")
+        if self.op != EditOperation.DELETE.value and not self.content.strip():
+            raise ValueError(f"{self.op} edit requires non-empty content")
+        if self.op == EditOperation.INSERT_AFTER.value and not self.target.strip():
+            raise ValueError("insert_after edit requires a target")
+        if (
+            self.op in {EditOperation.REPLACE.value, EditOperation.DELETE.value}
+            and not self.target.strip()
+            and not str(self.target_section or "").strip()
+        ):
+            raise ValueError(f"{self.op} edit requires a target or target_section")
+        return self
+
+    def to_edit_proposal(self, parent_skill_id: str, idx: int) -> EditProposal:
+        return EditProposal(
+            edit_id=self.edit_id or f"edit_{idx}",
+            parent_skill_id=parent_skill_id,
+            operation=EditOperation(self.op),
+            content=self.content,
+            target=self.target,
+            category=_parse_category(self.category),
+            target_section=_parse_section(self.target_section),
+            source_type=self.source_type,
+            rationale=self.rationale,
+            expected_effect=self.expected_effect,
+            risk=self.risk,
+            estimated_scope=self.estimated_scope,
+            edit_size_tokens=self.edit_size_tokens,
+        )
+
+
+class ReflectionOutput(BaseModel):
+    """Schema for the proposer's structured pool response."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    edits: list[ProposedEdit]
+
+
 class SkillOptReflectionProposer:
-    """LLM-backed reflection proposer returning bounded edit pools."""
+    """LLM-backed reflection proposer returning bounded edit pools.
+
+    Requests standard JSON mode from the provider and enforces schema
+    compliance locally with Pydantic. On a ``ValidationError`` it runs a bounded
+    retry/repair loop (sending the broken JSON and the error back to the model),
+    then safely degrades by dropping individually-invalid edits (TICKET-002).
+    """
 
     def __init__(
         self,
         *,
         llm: LLMGenerate | None = None,
         max_completion_edits: int = 24,
+        max_repair_attempts: int = 2,
+        strict_schema: bool = True,
     ) -> None:
         self.llm = llm or llm_generate
         self.max_completion_edits = int(max_completion_edits)
+        self.max_repair_attempts = max(0, int(max_repair_attempts))
+        self.strict_schema = bool(strict_schema)
 
     def propose_pool(
         self,
@@ -281,7 +458,31 @@ class SkillOptReflectionProposer:
     ) -> list[EditProposal]:
         prompt = _reflection_prompt(parent, trajectories, rejected, pool_size)
         raw = self.llm(prompt)
-        edits = _parse_edit_payload(raw, parent.skill_id)
+        expected_count = min(pool_size, self.max_completion_edits)
+        edits, error = _validate_reflection_payload(
+            raw,
+            parent.skill_id,
+            expected_count=expected_count,
+            strict_schema=self.strict_schema,
+        )
+
+        attempts = 0
+        while error is not None and attempts < self.max_repair_attempts:
+            raw = self.llm(_repair_prompt(raw, error, expected_count))
+            edits, error = _validate_reflection_payload(
+                raw,
+                parent.skill_id,
+                expected_count=expected_count,
+                strict_schema=self.strict_schema,
+            )
+            attempts += 1
+
+        if error is not None:
+            edits = _salvage_edits(
+                raw,
+                parent.skill_id,
+                strict_schema=self.strict_schema,
+            )
         return edits[: min(pool_size, self.max_completion_edits)]
 
 
@@ -294,15 +495,15 @@ def apply_markdown_edit(markdown: str, edit: EditProposal) -> str:
     if target and _is_in_slow_update_region(markdown, target):
         return markdown
     if op is EditOperation.APPEND:
-        return _append(markdown, content)
+        return _append_to_section(markdown, edit.target_section, content)
     if op is EditOperation.INSERT_AFTER:
-        return _insert_after(markdown, target, content)
+        return _insert_after(markdown, target, content, edit.target_section)
     if op is EditOperation.REPLACE:
         return _replace(markdown, target, content, edit.target_section)
     if op is EditOperation.DELETE:
         return _delete(markdown, target, edit.target_section)
     if op is EditOperation.MERGE:
-        return _append(markdown, content)
+        return _append_to_section(markdown, edit.target_section, content)
     return markdown
 
 
@@ -316,6 +517,24 @@ def exact_match_score(output: str, item: Mapping[str, Any]) -> float:
     return 1.0 if any(normalized == _normalize_answer(ans) for ans in expected) else 0.0
 
 
+def gsm8k_numeric_score(output: str, item: Mapping[str, Any]) -> float:
+    """Score a GSM8K completion by its final numeric answer.
+
+    GSM8K references use ``#### final``. Model completions may use that marker
+    or provide a derivation followed by the answer, so the fallback extracts
+    the last numeric value.
+    """
+
+    predicted = _extract_final_numeric_answer(output)
+    if predicted is None:
+        return 0.0
+    for answer in _expected_answers(item):
+        expected = _extract_final_numeric_answer(answer)
+        if expected is not None and _numeric_answers_equal(predicted, expected):
+            return 1.0
+    return 0.0
+
+
 def _append(markdown: str, content: str) -> str:
     su_start = markdown.find(SLOW_UPDATE_START)
     if su_start != -1:
@@ -325,9 +544,32 @@ def _append(markdown: str, content: str) -> str:
     return markdown.rstrip() + "\n\n" + content + "\n"
 
 
-def _insert_after(markdown: str, target: str, content: str) -> str:
-    if not target or target not in markdown:
+def _append_to_section(
+    markdown: str,
+    section: SkillSection | None,
+    content: str,
+) -> str:
+    """Append content within a named section, creating it if needed."""
+
+    if section is None or _starts_with_heading(content):
         return _append(markdown, content)
+    span = _section_span(markdown, section)
+    if span is None:
+        return _append(markdown, f"## {_section_title(section)}\n{content}")
+    _, _, _, section_end = span
+    before = markdown[:section_end].rstrip()
+    after = markdown[section_end:].lstrip("\n")
+    return _join_markdown_blocks(before, content, after)
+
+
+def _insert_after(
+    markdown: str,
+    target: str,
+    content: str,
+    section: SkillSection | None,
+) -> str:
+    if not target or target not in markdown:
+        return _append_to_section(markdown, section, content)
     idx = markdown.index(target) + len(target)
     newline = markdown.find("\n", idx)
     insert_at = newline + 1 if newline != -1 else len(markdown)
@@ -341,11 +583,15 @@ def _replace(
     section: SkillSection | None,
 ) -> str:
     if target:
-        if target in markdown:
-            return markdown.replace(target, content, 1)
         line_replaced = _replace_fuzzy_line(markdown, target, content)
         if line_replaced is not None:
             return line_replaced
+        if (
+            target in markdown
+            and not _starts_with_heading(target)
+            and not _target_overlaps_heading(markdown, target)
+        ):
+            return markdown.replace(target, content, 1)
     if section is not None:
         return _replace_section(markdown, section, content)
     return markdown
@@ -357,11 +603,15 @@ def _delete(
     section: SkillSection | None,
 ) -> str:
     if target:
-        if target in markdown:
-            return markdown.replace(target, "", 1)
         line_deleted = _replace_fuzzy_line(markdown, target, "")
         if line_deleted is not None:
             return line_deleted
+        if (
+            target in markdown
+            and not _starts_with_heading(target)
+            and not _target_overlaps_heading(markdown, target)
+        ):
+            return markdown.replace(target, "", 1)
     if section is not None:
         return _replace_section(markdown, section, "")
     return markdown
@@ -377,6 +627,8 @@ def _replace_fuzzy_line(
         return None
     parts = markdown.splitlines(keepends=True)
     for idx, line in enumerate(parts):
+        if _HEADING_RE.match(line.rstrip("\n")):
+            continue
         line_key = _line_match_key(line)
         if not line_key:
             continue
@@ -435,6 +687,10 @@ def _section_span(
 
 def _starts_with_heading(text: str) -> bool:
     return bool(_HEADING_RE.match(text.strip()))
+
+
+def _target_overlaps_heading(markdown: str, target: str) -> bool:
+    return any(target in match.group(0) for match in _HEADING_RE.finditer(markdown))
 
 
 def _join_markdown_blocks(*blocks: str) -> str:
@@ -505,6 +761,15 @@ def _render_section_value(value: Any) -> str:
     return str(value).strip()
 
 
+def _has_meaningful_section(
+    sections: Mapping[SkillSection, Any],
+    section: SkillSection,
+) -> bool:
+    value = _render_section_value(sections.get(section, ""))
+    without_empty_markers = re.sub(r"(?m)^\s*[-*+]\s*$", "", value)
+    return bool(without_empty_markers.strip())
+
+
 def _load_items(split_path: Path) -> list[dict[str, Any]]:
     if not split_path.exists():
         return []
@@ -522,6 +787,36 @@ def _load_items(split_path: Path) -> list[dict[str, Any]]:
                 rows.append(dict(json.loads(line)))
         return rows
     return []
+
+
+def _load_gsm8k_rows(
+    path: str | Path,
+    split_name: str,
+    limit: int | None,
+    *,
+    include_feedback: bool,
+) -> list[dict[str, Any]]:
+    source = Path(path)
+    rows: list[dict[str, Any]] = []
+    for idx, line in enumerate(source.read_text(encoding="utf-8-sig").splitlines()):
+        if not line.strip():
+            continue
+        raw = dict(json.loads(line))
+        answer = str(raw.get("answer", ""))
+        match = _GSM8K_FINAL_RE.search(answer)
+        if match is None:
+            raise ValueError(f"{source}:{idx + 1} missing GSM8K '#### final' answer")
+        row = {
+            "id": str(raw.get("id") or f"gsm8k_{split_name}_{idx}"),
+            "question": str(raw.get("question", "")),
+            "answers": [match.group(1).replace(",", "")],
+        }
+        if include_feedback:
+            row["feedback"] = answer
+        rows.append(row)
+        if limit is not None and len(rows) >= limit:
+            break
+    return rows
 
 
 def _item_id(item: Mapping[str, Any], idx: int, role: SplitRole) -> str:
@@ -547,11 +842,28 @@ def _expected_answers(item: Mapping[str, Any]) -> list[str]:
 
 
 def _compile_prompt(skill_markdown: str, task_input: str) -> str:
-    return f"{skill_markdown.rstrip()}\n\n## Task\n{task_input}\n"
+    skill_prefix = f"{skill_markdown.rstrip()}\n\n" if skill_markdown.strip() else ""
+    return f"{skill_prefix}## Task\n{task_input}\n"
 
 
 def _normalize_answer(text: str) -> str:
     return re.sub(r"\s+", " ", str(text).strip().lower())
+
+
+def _extract_final_numeric_answer(text: str) -> str | None:
+    text = str(text)
+    candidate = text.rsplit("####", 1)[-1] if "####" in text else text
+    matches = _NUMERIC_ANSWER_RE.findall(candidate)
+    if not matches:
+        return None
+    return matches[-1].replace(",", "")
+
+
+def _numeric_answers_equal(left: str, right: str) -> bool:
+    try:
+        return Decimal(left) == Decimal(right)
+    except InvalidOperation:
+        return False
 
 
 def _invalid_rate(trajectories: Sequence[Trajectory]) -> float:
@@ -585,7 +897,10 @@ def _reflection_prompt(
     ]
     return (
         "Propose bounded SkillOpt edits as JSON with an 'edits' array. "
-        "Each edit must include op, content, and optional target.\n\n"
+        "Return exactly the requested number of distinct edits. Each edit must "
+        "include edit_id, op, content, target, category, target_section, "
+        "rationale, expected_effect, risk, estimated_scope, and "
+        "edit_size_tokens. Keep content at or below 500 tokens.\n\n"
         f"Pool size: {pool_size}\n\n"
         f"## Current Skill\n{parent.document}\n\n"
         "## Recent Failures\n"
@@ -593,6 +908,167 @@ def _reflection_prompt(
         + "\n\n## Rejected Edits\n"
         + ("\n".join(rejected_lines) or "- none")
     )
+
+
+def _validate_reflection_payload(
+    raw: str,
+    parent_skill_id: str,
+    *,
+    expected_count: int,
+    strict_schema: bool,
+) -> tuple[list[EditProposal], str | None]:
+    """Validate a raw response against the schema.
+
+    Returns ``(edits, None)`` on success or ``([], error_message)`` when the
+    payload is unparseable or fails schema validation.
+    """
+
+    payload = _extract_json(raw)
+    if payload is None:
+        return [], "response was not valid JSON"
+    if isinstance(payload, list):
+        payload = {"edits": payload}
+    try:
+        output = ReflectionOutput.model_validate(payload)
+    except ValidationError as exc:
+        return [], _format_validation_error(exc)
+    pool_error = _pool_validation_error(
+        output.edits,
+        expected_count=expected_count,
+        strict_schema=strict_schema,
+    )
+    if pool_error is not None:
+        return [], pool_error
+    edits = [
+        edit.to_edit_proposal(parent_skill_id, idx)
+        for idx, edit in enumerate(output.edits)
+    ]
+    return edits, None
+
+
+def _salvage_edits(
+    raw: str,
+    parent_skill_id: str,
+    *,
+    strict_schema: bool,
+) -> list[EditProposal]:
+    """Keep individually schema-valid edits and drop the invalid ones."""
+
+    payload = _extract_json(raw)
+    rows = payload.get("edits", payload) if isinstance(payload, dict) else payload
+    if not isinstance(rows, list):
+        return []
+    edits: list[EditProposal] = []
+    for idx, row in enumerate(rows):
+        if not isinstance(row, dict):
+            continue
+        try:
+            edit = ProposedEdit.model_validate(row)
+        except ValidationError:
+            continue
+        if strict_schema and _strict_metadata_error(edit) is not None:
+            continue
+        edits.append(edit.to_edit_proposal(parent_skill_id, idx))
+    return _distinct_edits(edits)
+
+
+def _repair_prompt(broken: str, error: str, expected_count: int) -> str:
+    return (
+        "Your previous response did not satisfy the required schema. "
+        "Fix the JSON schema and return ONLY corrected JSON whose root is "
+        f'{{"edits": [...]}} with exactly {expected_count} distinct edits. '
+        "Every edit must include a valid op, bounded content, target metadata, "
+        "trace-grounded rationale, expected effect, risk, estimated scope, and "
+        "edit_size_tokens. Content must not exceed 500 tokens.\n\n"
+        f"## Validation Error\n{error}\n\n"
+        f"## Broken JSON\n{broken}\n"
+    )
+
+
+def _pool_validation_error(
+    edits: Sequence[ProposedEdit],
+    *,
+    expected_count: int,
+    strict_schema: bool,
+) -> str | None:
+    if len(edits) != expected_count:
+        return f"edits: expected exactly {expected_count}, received {len(edits)}"
+    signatures: set[tuple[str, str, str, str]] = set()
+    edit_ids: set[str] = set()
+    for idx, edit in enumerate(edits):
+        if strict_schema:
+            error = _strict_metadata_error(edit)
+            if error is not None:
+                return f"edits.{idx}: {error}"
+        signature = _edit_signature(edit)
+        if signature in signatures:
+            return f"edits.{idx}: duplicate edit route"
+        signatures.add(signature)
+        if edit.edit_id:
+            if edit.edit_id in edit_ids:
+                return f"edits.{idx}: duplicate edit_id {edit.edit_id!r}"
+            edit_ids.add(edit.edit_id)
+    return None
+
+
+def _strict_metadata_error(edit: ProposedEdit) -> str | None:
+    required = {
+        "edit_id": edit.edit_id,
+        "category": edit.category,
+        "target_section": edit.target_section,
+        "rationale": edit.rationale,
+        "expected_effect": edit.expected_effect,
+        "risk": edit.risk,
+        "estimated_scope": edit.estimated_scope,
+    }
+    missing = [name for name, value in required.items() if not str(value or "").strip()]
+    if missing:
+        return f"missing required fields: {', '.join(missing)}"
+    if _parse_category(edit.category) is None:
+        return f"unknown category: {edit.category!r}"
+    if _parse_section(edit.target_section) is None:
+        return f"unknown target_section: {edit.target_section!r}"
+    if edit.edit_size_tokens <= 0:
+        return "edit_size_tokens must be positive"
+    if edit.edit_size_tokens > 500:
+        return "edit_size_tokens exceeds the 500-token ceiling"
+    return None
+
+
+def _edit_signature(edit: ProposedEdit) -> tuple[str, str, str, str]:
+    return (
+        edit.op,
+        edit.target.strip().lower(),
+        edit.content.strip().lower(),
+        str(edit.target_section or "").strip().lower(),
+    )
+
+
+def _distinct_edits(edits: Sequence[EditProposal]) -> list[EditProposal]:
+    seen: set[tuple[str, str, str, str]] = set()
+    seen_ids: set[str] = set()
+    distinct: list[EditProposal] = []
+    for edit in edits:
+        signature = (
+            edit.operation.value,
+            edit.target.strip().lower(),
+            edit.content.strip().lower(),
+            edit.target_section.value if edit.target_section is not None else "",
+        )
+        if signature in seen or edit.edit_id in seen_ids:
+            continue
+        seen.add(signature)
+        seen_ids.add(edit.edit_id)
+        distinct.append(edit)
+    return distinct
+
+
+def _format_validation_error(exc: ValidationError) -> str:
+    parts = []
+    for err in exc.errors():
+        loc = ".".join(str(p) for p in err.get("loc", ()))
+        parts.append(f"{loc}: {err.get('msg', '')}".strip(": "))
+    return "; ".join(parts) or str(exc)
 
 
 def _parse_edit_payload(raw: str, parent_skill_id: str) -> list[EditProposal]:
@@ -680,6 +1156,9 @@ def _parse_section(value: object) -> SkillSection | None:
 
 
 __all__ = [
+    "GSM8KMiniDatasetProvider",
+    "ProposedEdit",
+    "ReflectionOutput",
     "SkillOptDatasetProvider",
     "SkillOptEditApplicator",
     "SkillOptEvaluator",
@@ -688,5 +1167,6 @@ __all__ = [
     "SkillOptSerializer",
     "apply_markdown_edit",
     "exact_match_score",
+    "gsm8k_numeric_score",
     "llm_generate",
 ]

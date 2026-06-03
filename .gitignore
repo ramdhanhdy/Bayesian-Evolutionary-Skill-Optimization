@@ -6,3 +6,17 @@
 .env
 .venv/*
 *.egg-info/
+artifacts/*.jsonl
+data/gsm8k/*.jsonl
+*/internal_docs/*
+*KANBAN.md
+\.venv
+\.ruff_cache
+AGENTS.md
+/docs/external_references/
+/docs/external_references-bib4llm/
+/docs/notes/*
+docs/notes/high-performance-plateau-and-archive-admission.md
+docs/notes/high-performance-plateau-and-archive-admission.md
+docs/decisions/v0.0/0001-separate-deployable-promotion-from-exploration-archive-admission.md
+docs/decisions/README.md

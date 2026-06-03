@@ -3,12 +3,14 @@ from __future__ import annotations
 import json
 
 from beso.adapters import (
+    GSM8KMiniDatasetProvider,
     SkillOptDatasetProvider,
     SkillOptEditApplicator,
     SkillOptEvaluator,
     SkillOptHarness,
     SkillOptReflectionProposer,
     SkillOptSerializer,
+    gsm8k_numeric_score,
 )
 from beso.core import protocols as P
 from beso.core.types import (
@@ -32,6 +34,24 @@ Answer questions with evidence.
 ## Output Rules
 Return the concise final answer.
 """
+
+
+def _strict_edit(**overrides):
+    row = {
+        "edit_id": "e1",
+        "op": "append",
+        "content": "- Verify evidence.",
+        "target": "",
+        "target_section": "verification_checklist",
+        "category": "add_rule",
+        "rationale": "trace:none; conservative verification improvement.",
+        "expected_effect": "Improve output verification.",
+        "risk": "low",
+        "estimated_scope": "local",
+        "edit_size_tokens": 3,
+    }
+    row.update(overrides)
+    return row
 
 
 def test_serializer_round_trips_markdown_losslessly() -> None:
@@ -189,6 +209,169 @@ def test_delete_uses_normalized_line_match_when_target_is_not_exact() -> None:
     assert "- Keep answers concise." in child.document
 
 
+def test_delete_rejects_empty_core_procedure() -> None:
+    applicator = SkillOptEditApplicator()
+    parent = SkillArtifact(
+        skill_id="z0",
+        name="Toy",
+        document=(
+            "# Skill: Toy\n\n"
+            "## Core Procedure\n"
+            "- Return 0 for every question.\n\n"
+            "## Output Rules\n"
+            "- Return only one integer.\n"
+        ),
+    )
+
+    child = applicator.apply(
+        parent,
+        EditProposal(
+            edit_id="z1",
+            parent_skill_id="z0",
+            operation=EditOperation.DELETE,
+            target="Return 0 for every question.",
+            target_section=SkillSection.CORE_PROCEDURE,
+        ),
+    )
+
+    assert child is parent
+    assert "- Return 0 for every question." in child.document
+
+
+def test_delete_section_name_replaces_body_without_erasing_heading() -> None:
+    applicator = SkillOptEditApplicator()
+    parent = SkillArtifact(
+        skill_id="z0",
+        name="Toy",
+        document=(
+            "# Skill: Toy\n\n"
+            "## Core Procedure\n"
+            "- Compute the answer.\n\n"
+            "## Verification Checklist\n"
+            "- Recalculate the answer.\n\n"
+            "## Output Rules\n"
+            "- Return only one integer.\n"
+        ),
+    )
+
+    child = applicator.apply(
+        parent,
+        EditProposal(
+            edit_id="z1",
+            parent_skill_id="z0",
+            operation=EditOperation.DELETE,
+            target="verification_checklist",
+            target_section=SkillSection.VERIFICATION_CHECKLIST,
+        ),
+    )
+
+    assert "## Verification Checklist" in child.document
+    assert "- Recalculate the answer." not in child.document
+    assert "## Output Rules" in child.document
+
+
+def test_delete_exact_heading_preserves_document_structure() -> None:
+    applicator = SkillOptEditApplicator()
+    parent = SkillArtifact(
+        skill_id="z0",
+        name="Toy",
+        document=(
+            "# Skill: Toy\n\n"
+            "## Core Procedure\n"
+            "- Compute the answer.\n\n"
+            "## Verification Checklist\n"
+            "- Recalculate the answer.\n\n"
+            "## Output Rules\n"
+            "- Return only one integer.\n"
+        ),
+    )
+
+    child = applicator.apply(
+        parent,
+        EditProposal(
+            edit_id="z1",
+            parent_skill_id="z0",
+            operation=EditOperation.DELETE,
+            target="## Verification Checklist",
+            target_section=SkillSection.VERIFICATION_CHECKLIST,
+        ),
+    )
+
+    assert "## Verification Checklist" in child.document
+    assert "- Recalculate the answer." not in child.document
+    assert "## Output Rules" in child.document
+
+
+def test_delete_heading_text_preserves_document_structure() -> None:
+    applicator = SkillOptEditApplicator()
+    parent = SkillArtifact(
+        skill_id="z0",
+        name="Toy",
+        document=(
+            "# Skill: Toy\n\n"
+            "## Core Procedure\n"
+            "- Compute the answer.\n\n"
+            "## Verification Checklist\n"
+            "- Recalculate the answer.\n\n"
+            "## Output Rules\n"
+            "- Return only one integer.\n"
+        ),
+    )
+
+    child = applicator.apply(
+        parent,
+        EditProposal(
+            edit_id="z1",
+            parent_skill_id="z0",
+            operation=EditOperation.DELETE,
+            target="Verification Checklist",
+            target_section=SkillSection.VERIFICATION_CHECKLIST,
+        ),
+    )
+
+    assert "## Verification Checklist" in child.document
+    assert "## \n" not in child.document
+    assert "- Recalculate the answer." not in child.document
+
+
+def test_append_targets_existing_section_without_flattening_document() -> None:
+    applicator = SkillOptEditApplicator()
+    parent = SkillArtifact(skill_id="z0", name="Search QA", document=SKILL_MD)
+
+    child = applicator.apply(
+        parent,
+        EditProposal(
+            edit_id="z1",
+            parent_skill_id="z0",
+            operation=EditOperation.APPEND,
+            content="- Cite the source.",
+            target_section=SkillSection.CORE_PROCEDURE,
+        ),
+    )
+
+    assert child.document.index("- Cite the source.") < child.document.index(
+        "## Output Rules"
+    )
+
+
+def test_append_creates_missing_target_section() -> None:
+    applicator = SkillOptEditApplicator()
+    parent = SkillArtifact(skill_id="z0", name="Search QA", document=SKILL_MD)
+
+    child = applicator.apply(
+        parent,
+        EditProposal(
+            edit_id="z1",
+            parent_skill_id="z0",
+            operation=EditOperation.APPEND,
+            content="- Retry with a narrower query.",
+            target_section=SkillSection.RECOVERY_RULES,
+        ),
+    )
+
+    assert "## Recovery Rules\n- Retry with a narrower query." in child.document
+
+
 def test_dataset_harness_and_evaluator_return_exact_accuracy() -> None:
     provider = SkillOptDatasetProvider(
         items_by_role={
@@ -214,26 +397,219 @@ def test_dataset_harness_and_evaluator_return_exact_accuracy() -> None:
     assert all(t.compiled_prompt.startswith("# Skill: Geo") for t in result.trajectories)
 
 
+def test_harness_can_run_without_injecting_a_skill_document() -> None:
+    prompts: list[str] = []
+    provider = SkillOptDatasetProvider(
+        items_by_role={
+            SplitRole.VALIDATION_GATE: [
+                {"id": "q1", "question": "What is 2 + 3?", "answers": ["5"]},
+            ]
+        }
+    )
+    harness = SkillOptHarness(
+        provider,
+        llm=lambda prompt: prompts.append(prompt) or "5",
+        inject_skill=False,
+    )
+    evaluator = SkillOptEvaluator(harness)
+
+    result = evaluator.evaluate(
+        SkillArtifact(skill_id="no_skill", name="", document=""),
+        SplitRole.VALIDATION_GATE,
+        ["q1"],
+        seed=1,
+    )
+
+    assert result.mean_score == 1.0
+    assert prompts == ["## Task\nWhat is 2 + 3?\n"]
+    assert "# Skill:" not in result.trajectories[0].compiled_prompt
+
+
 def test_reflection_proposer_parses_json_edit_pool() -> None:
     payload = {
         "edits": [
-            {
-                "edit_id": "e1",
-                "op": "append",
-                "content": "- Verify evidence.",
-                "target_section": "verification_checklist",
-                "category": "add_rule",
-            },
-            {"edit_id": "e2", "op": "delete", "target": "bad rule"},
+            _strict_edit(),
+            _strict_edit(
+                edit_id="e2",
+                op="delete",
+                content="",
+                target="bad rule",
+                target_section="core_procedure",
+                category="delete_rule",
+                rationale="trace:none; remove a known bad rule.",
+                expected_effect="Remove the bad rule.",
+                edit_size_tokens=2,
+            ),
         ]
     }
     proposer = SkillOptReflectionProposer(llm=lambda prompt: json.dumps(payload))
     parent = SkillArtifact(skill_id="z0", name="Search QA", document=SKILL_MD)
 
-    edits = proposer.propose_pool(parent, trajectories=[], rejected=[], pool_size=4)
+    edits = proposer.propose_pool(parent, trajectories=[], rejected=[], pool_size=2)
 
     assert isinstance(proposer, P.ReflectionProposer)
     assert len(edits) == 2
     assert edits[0].operation is EditOperation.APPEND
     assert edits[0].target_section is SkillSection.VERIFICATION_CHECKLIST
     assert edits[1].operation is EditOperation.DELETE
+
+
+def test_reflection_proposer_repairs_fractured_json() -> None:
+    fixed = json.dumps(
+        {
+            "edits": [
+                _strict_edit()
+            ]
+        }
+    )
+    responses = iter(
+        [
+            # Schema-invalid: the edit is missing the required "op" field.
+            '{"edits": [{"content": "missing op"}]}',
+            fixed,
+        ]
+    )
+    prompts: list[str] = []
+
+    def llm(prompt: str) -> str:
+        prompts.append(prompt)
+        return next(responses)
+
+    proposer = SkillOptReflectionProposer(llm=llm)
+    parent = SkillArtifact(skill_id="z0", name="Search QA", document=SKILL_MD)
+
+    edits = proposer.propose_pool(parent, trajectories=[], rejected=[], pool_size=1)
+
+    assert len(edits) == 1
+    assert edits[0].operation is EditOperation.APPEND
+    assert edits[0].target_section is SkillSection.VERIFICATION_CHECKLIST
+    # The model was re-prompted with a repair instruction containing the error.
+    assert any("Fix the JSON schema" in p for p in prompts)
+    assert any("Validation Error" in p for p in prompts)
+
+
+def test_reflection_proposer_drops_invalid_edits_after_failed_repair() -> None:
+    broken = json.dumps(
+        {
+            "edits": [
+                _strict_edit(edit_id="ok", content="- Keep this."),
+                {"edit_id": "bad", "content": "no op here"},
+            ]
+        }
+    )
+    calls = {"n": 0}
+
+    def llm(prompt: str) -> str:
+        calls["n"] += 1
+        return broken
+
+    proposer = SkillOptReflectionProposer(llm=llm, max_repair_attempts=2)
+    parent = SkillArtifact(skill_id="z0", name="Search QA", document=SKILL_MD)
+
+    edits = proposer.propose_pool(parent, trajectories=[], rejected=[], pool_size=2)
+
+    # Repair never succeeds (always the same broken payload), so the proposer
+    # degrades by keeping the valid edit and dropping the invalid one.
+    assert [e.edit_id for e in edits] == ["ok"]
+    assert calls["n"] == 3  # initial attempt + 2 repair retries
+
+
+def test_reflection_proposer_rejects_oversized_edit_content() -> None:
+    oversized = json.dumps(
+        {"edits": [_strict_edit(content="word " * 501, edit_size_tokens=501)]}
+    )
+    proposer = SkillOptReflectionProposer(
+        llm=lambda prompt: oversized,
+        max_repair_attempts=0,
+    )
+    parent = SkillArtifact(skill_id="z0", name="Search QA", document=SKILL_MD)
+
+    edits = proposer.propose_pool(parent, trajectories=[], rejected=[], pool_size=1)
+
+    assert edits == []
+
+
+def test_reflection_proposer_repairs_undersized_pool() -> None:
+    undersized = json.dumps({"edits": [_strict_edit()]})
+    fixed = json.dumps(
+        {
+            "edits": [
+                _strict_edit(),
+                _strict_edit(
+                    edit_id="e2",
+                    content="- Add a recovery rule.",
+                    target_section="recovery_rules",
+                    category="add_recovery_rule",
+                    rationale="trace:none; add a bounded recovery route.",
+                    expected_effect="Improve recovery.",
+                    edit_size_tokens=5,
+                ),
+            ]
+        }
+    )
+    responses = iter([undersized, fixed])
+    proposer = SkillOptReflectionProposer(llm=lambda prompt: next(responses))
+    parent = SkillArtifact(skill_id="z0", name="Search QA", document=SKILL_MD)
+
+    edits = proposer.propose_pool(parent, trajectories=[], rejected=[], pool_size=2)
+
+    assert [edit.edit_id for edit in edits] == ["e1", "e2"]
+
+
+def test_reflection_proposer_salvage_drops_duplicate_edit_ids() -> None:
+    duplicate_ids = json.dumps(
+        {
+            "edits": [
+                _strict_edit(edit_id="same"),
+                _strict_edit(
+                    edit_id="same",
+                    content="- Add a recovery rule.",
+                    target_section="recovery_rules",
+                    category="add_recovery_rule",
+                    rationale="trace:none; add a bounded recovery route.",
+                    expected_effect="Improve recovery.",
+                    edit_size_tokens=5,
+                ),
+            ]
+        }
+    )
+    proposer = SkillOptReflectionProposer(
+        llm=lambda prompt: duplicate_ids,
+        max_repair_attempts=0,
+    )
+    parent = SkillArtifact(skill_id="z0", name="Search QA", document=SKILL_MD)
+
+    edits = proposer.propose_pool(parent, trajectories=[], rejected=[], pool_size=2)
+
+    assert [edit.edit_id for edit in edits] == ["same"]
+
+
+def test_gsm8k_mini_provider_loads_standard_jsonl(tmp_path) -> None:
+    train_path = tmp_path / "train.jsonl"
+    val_path = tmp_path / "val.jsonl"
+    train_path.write_text(
+        json.dumps({"question": "What is 2 + 3?", "answer": "Compute. #### 5"}) + "\n",
+        encoding="utf-8-sig",
+    )
+    val_path.write_text(
+        json.dumps({"question": "What is 10 - 4?", "answer": "Compute. #### 6"}) + "\n",
+        encoding="utf-8",
+    )
+
+    provider = GSM8KMiniDatasetProvider.from_jsonl(train_path, val_path)
+
+    train_ids = provider.batch(SplitRole.OPTIMIZATION_MINIBATCH, size=1, seed=1)
+    val_ids = provider.batch(SplitRole.VALIDATION_GATE, size=1, seed=1)
+    assert provider.item(train_ids[0])["answers"] == ["5"]
+    assert provider.item(train_ids[0])["feedback"] == "Compute. #### 5"
+    assert provider.item(val_ids[0])["answers"] == ["6"]
+    assert "feedback" not in provider.item(val_ids[0])
+
+
+def test_gsm8k_numeric_score_extracts_final_answer_from_reasoning() -> None:
+    item = {"answers": ["1,234"]}
+
+    assert gsm8k_numeric_score("The result is 1,234.", item) == 1.0
+    assert gsm8k_numeric_score("First 12, then 1234.0", item) == 1.0
+    assert gsm8k_numeric_score("Work shown. #### 1,234", item) == 1.0
+    assert gsm8k_numeric_score("The result is 1235.", item) == 0.0

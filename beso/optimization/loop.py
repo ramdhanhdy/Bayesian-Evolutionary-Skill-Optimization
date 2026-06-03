@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import difflib
+import inspect
 from dataclasses import dataclass, field
-from typing import Callable, Optional, Sequence
+from typing import Any, Callable, Optional, Sequence
 
 import numpy as np
 
@@ -38,7 +40,11 @@ from beso.core.types import (
     SurrogatePrediction,
     Trajectory,
 )
-from beso.optimization.accept_reject import apply_benjamini_hochberg
+from beso.optimization.accept_reject import (
+    PARETO_CLEANUP_REASON,
+    apply_benjamini_hochberg,
+)
+from beso.optimization.logger import JSONLLogger
 
 CandidateFilter = Callable[[Candidate], bool]
 MultiplicityCorrection = Callable[[Sequence[GateDecision]], list[GateDecision]]
@@ -53,6 +59,7 @@ class BESOOptimizerConfig:
     batch_size: int = 2
     parent_count: int = 1
     optimization_batch_size: int = 8
+    feedback_batch_size: int = 0
     validation_batch_size: int = 8
     seed: int = 0
     fallback_strategy: str = "random"
@@ -69,6 +76,8 @@ class BESOOptimizerConfig:
             raise ValueError("parent_count must be positive")
         if self.optimization_batch_size <= 0:
             raise ValueError("optimization_batch_size must be positive")
+        if self.feedback_batch_size < 0:
+            raise ValueError("feedback_batch_size must be non-negative")
         if self.validation_batch_size <= 0:
             raise ValueError("validation_batch_size must be positive")
         if self.fallback_strategy not in {"random", "greedy"}:
@@ -123,6 +132,7 @@ class BESOOptimizer:
         config: Optional[BESOOptimizerConfig] = None,
         candidate_filter: CandidateFilter | None = None,
         multiplicity_correction: MultiplicityCorrection | None = None,
+        logger: Optional[JSONLLogger] = None,
     ) -> None:
         self.dataset = dataset
         self.evaluator = evaluator
@@ -140,6 +150,7 @@ class BESOOptimizer:
         self.multiplicity_correction = (
             multiplicity_correction or apply_benjamini_hochberg
         )
+        self.logger = logger
 
         self.observations: list[Observation] = []
         self.features: dict[str, CandidateFeatures] = {}
@@ -188,6 +199,17 @@ class BESOOptimizer:
             self.features[seed_candidate.candidate_id] = seed_candidate.features
             self.archive.update([seed_candidate], [seed_eval])
 
+        if self.config.feedback_batch_size > 0 and not budget.exhausted:
+            feedback_eval = self._evaluate_with_budget(
+                initial_skill,
+                SplitRole.FEEDBACK_TRAIN,
+                self.config.feedback_batch_size,
+                self.config.seed,
+                budget,
+            )
+            if feedback_eval is not None:
+                self._remember_evaluation(seed_candidate, feedback_eval)
+
         for iteration in range(self.config.max_iterations):
             if budget.exhausted:
                 break
@@ -209,9 +231,15 @@ class BESOOptimizer:
         iteration: int,
         budget: RolloutBudget,
     ) -> IterationRecord | None:
-        parents = self.archive.select_parents(self.config.parent_count, self._seed(iteration))
+        parent_seed = self._seed(iteration)
+        parents = self.archive.select_parents(self.config.parent_count, parent_seed)
         if not parents:
             return None
+        parent_selection = self._parent_selection_audit(
+            requested_parent_count=self.config.parent_count,
+            seed=parent_seed,
+            parents=parents,
+        )
 
         pool = self._build_candidate_pool(parents, iteration)
         if not pool:
@@ -266,15 +294,28 @@ class BESOOptimizer:
         decisions = self.multiplicity_correction(decisions) if decisions else []
         accepted_ids = {d.candidate_id for d in decisions if d.accepted}
         rejected_ids = {d.candidate_id for d in decisions if not d.accepted}
+        cleanup_ids = {
+            d.candidate_id
+            for d in decisions
+            if d.accepted and d.reason.startswith(PARETO_CLEANUP_REASON)
+        }
+        admission_reasons = {
+            d.candidate_id: [d.reason] for d in decisions if d.accepted
+        }
         accepted = [c for c in selected if c.candidate_id in accepted_ids]
         accepted_evals = [val_evals[c.candidate_id] for c in accepted]
         if accepted:
-            self.archive.update(accepted, accepted_evals)
+            self._archive_update(
+                accepted,
+                accepted_evals,
+                cleanup_ids,
+                admission_reasons,
+            )
         for candidate in selected:
             if candidate.candidate_id in rejected_ids and candidate.edit is not None:
                 self.rejected_edits.append(candidate.edit)
 
-        return IterationRecord(
+        record = IterationRecord(
             iteration=iteration,
             used_surrogate=use_surrogate,
             fallback_reason=fallback_reason,
@@ -287,6 +328,116 @@ class BESOOptimizer:
             budget_spent=budget.spent_rollouts,
             budget_remaining=budget.remaining,
         )
+        self._log_iteration(
+            iteration=iteration,
+            budget=budget,
+            pool=pool,
+            selected=selected,
+            parents=parents,
+            parent_selection=parent_selection,
+            opt_evals=opt_evals,
+            val_evals=val_evals,
+            decisions=decisions,
+        )
+        return record
+
+    def _log_iteration(
+        self,
+        *,
+        iteration: int,
+        budget: RolloutBudget,
+        pool: Sequence[Candidate],
+        selected: Sequence[Candidate],
+        parents: Sequence[ArchiveEntry],
+        parent_selection: dict[str, Any] | None,
+        opt_evals: dict[str, EvaluationResult],
+        val_evals: dict[str, EvaluationResult],
+        decisions: Sequence[GateDecision],
+    ) -> None:
+        if self.logger is None:
+            return
+
+        evals: dict[str, dict[str, dict[str, float]]] = {}
+        for cid, ev in opt_evals.items():
+            evals.setdefault(cid, {})["optimization"] = dict(ev.per_example_scores)
+        for cid, ev in val_evals.items():
+            evals.setdefault(cid, {})["validation"] = dict(ev.per_example_scores)
+
+        payload = {
+            "iteration": iteration,
+            "spent_rollouts": budget.spent_rollouts,
+            "budget_remaining": budget.remaining,
+            "pool_edits": [c.edit for c in pool if c.edit is not None],
+            "diffs": {
+                c.candidate_id: self._candidate_diff(c, parents) for c in selected
+            },
+            "predictions": {c.candidate_id: c.prediction for c in pool},
+            "acquisition_scores": {
+                c.candidate_id: c.acquisition_score for c in pool
+            },
+            "selected_ids": [c.candidate_id for c in selected],
+            "evals": evals,
+            "gate_decisions": list(decisions),
+            "archive_snapshot": list(self.archive.entries()),
+        }
+        if parent_selection is not None:
+            payload["parent_selection"] = parent_selection
+        self.logger.log(payload)
+
+    def _parent_selection_audit(
+        self,
+        *,
+        requested_parent_count: int,
+        seed: int,
+        parents: Sequence[ArchiveEntry],
+    ) -> dict[str, Any] | None:
+        if self.logger is None or not hasattr(self.archive, "parent_selection_table"):
+            return None
+        table = getattr(self.archive, "parent_selection_table")
+        return table(
+            requested_parent_count,
+            seed,
+            selected_ids=[parent.candidate_id for parent in parents],
+        )
+
+    def _candidate_diff(
+        self,
+        candidate: Candidate,
+        parents: Sequence[ArchiveEntry],
+    ) -> str:
+        parent = self._parent_artifact(candidate.parent_id, parents)
+        parent_doc = parent.document if parent is not None else ""
+        diff = difflib.unified_diff(
+            parent_doc.splitlines(),
+            candidate.skill.document.splitlines(),
+            fromfile="parent",
+            tofile="child",
+            lineterm="",
+        )
+        return "\n".join(diff)
+
+    def _archive_update(
+        self,
+        accepted: Sequence[Candidate],
+        accepted_evals: Sequence[EvaluationResult],
+        cleanup_ids: set[str],
+        admission_reasons: dict[str, list[str]],
+    ) -> None:
+        """Update the archive, forwarding cleanup ids when supported."""
+
+        kwargs: dict[str, Any] = {}
+        if cleanup_ids and self._archive_supports_kwarg("cleanup_ids"):
+            kwargs["cleanup_ids"] = cleanup_ids
+        if admission_reasons and self._archive_supports_kwarg("admission_reasons"):
+            kwargs["admission_reasons"] = admission_reasons
+        self.archive.update(accepted, accepted_evals, **kwargs)
+
+    def _archive_supports_kwarg(self, name: str) -> bool:
+        try:
+            params = inspect.signature(self.archive.update).parameters
+        except (TypeError, ValueError):
+            return False
+        return name in params
 
     def _build_candidate_pool(
         self,
@@ -478,7 +629,11 @@ class BESOOptimizer:
                 split=ev.split,
             )
         )
-        self.trajectories[candidate.candidate_id] = list(ev.trajectories)
+        if ev.split in {
+            SplitRole.FEEDBACK_TRAIN,
+            SplitRole.OPTIMIZATION_MINIBATCH,
+        }:
+            self.trajectories[candidate.candidate_id] = list(ev.trajectories)
 
     def _parent_artifact(
         self,
@@ -533,7 +688,7 @@ def _fallback_repair_priority(candidate: Candidate) -> float:
         score += 1.0
 
     if edit.target_section is SkillSection.CORE_PROCEDURE:
-        score += 3.0
+        score += 8.0
     elif edit.target_section in {
         SkillSection.RECOVERY_RULES,
         SkillSection.VERIFICATION_CHECKLIST,
@@ -556,12 +711,14 @@ def _fallback_repair_priority(candidate: Candidate) -> float:
             edit.expected_effect,
         ]
     ).lower()
-    if "return 0" in evidence or "do not recalculate" in evidence:
-        score += 8.0
+    if "return 0" in evidence:
+        score += 10.0
+    if "do not recalculate" in evidence:
+        score += 4.0
 
     document = candidate.skill.document.lower()
-    if "return 0 for every question" not in document:
-        score += 8.0
+    if "return 0" not in document:
+        score += 16.0
     elif edit.operation is EditOperation.APPEND:
         score -= 1.0
 

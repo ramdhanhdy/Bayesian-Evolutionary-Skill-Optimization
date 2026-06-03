@@ -8,6 +8,7 @@ from typing import Sequence
 import numpy as np
 
 from beso.core.protocols import Surrogate
+from beso.core.types import EvaluationResult
 
 
 @dataclass(frozen=True)
@@ -19,6 +20,30 @@ class RegimeDetectorConfig:
     min_scores: int = 3
     require_calibrated: bool = True
     eps: float = 1e-12
+
+
+@dataclass(frozen=True)
+class PlateauDiagnosticConfig:
+    """Thresholds for detecting saturated binary validation draws."""
+
+    max_score: float = 1.0
+    alpha: float = 0.10
+    saturation_score: float = 0.95
+    eps: float = 1e-12
+
+
+@dataclass(frozen=True)
+class PlateauDiagnostic:
+    """Read-only diagnosis of validation headroom, not a runtime policy."""
+
+    saturated: bool
+    validation_n: int
+    current_mean: float
+    promotion_headroom: float
+    improvable_count: int
+    best_possible_exact_mcnemar_p: float | None
+    promotion_possible_under_exact_mcnemar: bool | None
+    reason: str
 
 
 class VarianceRankRegimeDetector:
@@ -79,6 +104,76 @@ def spearman_rank_correlation(
     return corr if np.isfinite(corr) else 0.0
 
 
+def diagnose_binary_validation_plateau(
+    validation: EvaluationResult | Sequence[float],
+    config: PlateauDiagnosticConfig | None = None,
+) -> PlateauDiagnostic:
+    """Diagnose whether a binary validation draw lacks promotion headroom.
+
+    This is intentionally diagnostic only. It does not change optimizer control
+    flow and should be used by experiment protocols before claiming a benchmark
+    plateau.
+    """
+
+    cfg = config or PlateauDiagnosticConfig()
+    scores = (
+        list(validation.per_example_scores.values())
+        if isinstance(validation, EvaluationResult)
+        else list(validation)
+    )
+    arr = _finite_array(scores)
+    if arr.size == 0:
+        raise ValueError("plateau diagnosis requires at least one finite score")
+
+    current_mean = float(np.mean(arr))
+    promotion_headroom = max(0.0, float(cfg.max_score - current_mean))
+    is_binary = bool(
+        np.all(
+            np.isclose(arr, 0.0, atol=cfg.eps)
+            | np.isclose(arr, cfg.max_score, atol=cfg.eps)
+        )
+    )
+    if not is_binary:
+        return PlateauDiagnostic(
+            saturated=False,
+            validation_n=int(arr.size),
+            current_mean=current_mean,
+            promotion_headroom=promotion_headroom,
+            improvable_count=0,
+            best_possible_exact_mcnemar_p=None,
+            promotion_possible_under_exact_mcnemar=None,
+            reason="non_binary_scores",
+        )
+
+    improvable_count = int(np.sum(arr < cfg.max_score - cfg.eps))
+    best_possible_p = (
+        1.0
+        if improvable_count == 0
+        else float(2.0 ** (-improvable_count))
+    )
+    promotion_possible = improvable_count > 0 and best_possible_p <= cfg.alpha
+    saturated = current_mean >= cfg.saturation_score and not promotion_possible
+    if saturated and improvable_count == 0:
+        reason = "perfect_validation_draw"
+    elif saturated:
+        reason = "saturated_binary_validation_draw"
+    elif current_mean < cfg.saturation_score:
+        reason = "below_saturation_threshold"
+    else:
+        reason = "promotion_headroom_available"
+
+    return PlateauDiagnostic(
+        saturated=saturated,
+        validation_n=int(arr.size),
+        current_mean=current_mean,
+        promotion_headroom=promotion_headroom,
+        improvable_count=improvable_count,
+        best_possible_exact_mcnemar_p=best_possible_p,
+        promotion_possible_under_exact_mcnemar=promotion_possible,
+        reason=reason,
+    )
+
+
 def _average_ranks(values: np.ndarray) -> np.ndarray:
     order = np.argsort(values, kind="mergesort")
     ranks = np.empty(values.size, dtype=np.float64)
@@ -100,7 +195,10 @@ def _finite_array(values: Sequence[float]) -> np.ndarray:
 
 
 __all__ = [
+    "PlateauDiagnostic",
+    "PlateauDiagnosticConfig",
     "RegimeDetectorConfig",
     "VarianceRankRegimeDetector",
+    "diagnose_binary_validation_plateau",
     "spearman_rank_correlation",
 ]

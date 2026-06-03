@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from typing import Sequence
 
 from beso.archive import ArchiveConfig, EvolutionaryArchive
@@ -18,7 +19,7 @@ from beso.core.types import (
     SurrogatePrediction,
     Trajectory,
 )
-from beso.optimization import BESOOptimizer, BESOOptimizerConfig
+from beso.optimization import BESOOptimizer, BESOOptimizerConfig, JSONLLogger
 from beso.adapters import SkillOptEditApplicator
 
 
@@ -83,6 +84,21 @@ class FakeProposer:
             ),
         ]
         return edits[:pool_size]
+
+
+class RecordingProposer(FakeProposer):
+    def __init__(self) -> None:
+        self.trajectory_ids: list[str] = []
+
+    def propose_pool(
+        self,
+        parent: SkillArtifact,
+        trajectories: Sequence[Trajectory],
+        rejected: Sequence[EditProposal],
+        pool_size: int,
+    ) -> list[EditProposal]:
+        self.trajectory_ids = [trajectory.example_id for trajectory in trajectories]
+        return super().propose_pool(parent, trajectories, rejected, pool_size)
 
 
 class FakeApplicator:
@@ -196,7 +212,12 @@ class ToggleRegime:
         return self.enabled
 
 
-def _optimizer(regime_enabled: bool = True):
+def _optimizer(
+    regime_enabled: bool = True,
+    logger=None,
+    *,
+    feedback_batch_size: int = 0,
+):
     archive = EvolutionaryArchive(
         ArchiveConfig(
             max_size=8,
@@ -227,11 +248,13 @@ def _optimizer(regime_enabled: bool = True):
             candidate_pool_size=2,
             batch_size=1,
             optimization_batch_size=1,
+            feedback_batch_size=feedback_batch_size,
             validation_batch_size=1,
             seed=11,
             fallback_strategy="greedy",
         ),
         multiplicity_correction=lambda decisions: list(decisions),
+        logger=logger,
     )
     return opt, surrogate, acquisition, selector, regime
 
@@ -269,6 +292,20 @@ def test_optimizer_regime_fallback_bypasses_bayesian_math() -> None:
     assert acquisition.calls == 0
     assert selector.calls == 0
     assert regime.calls == 1
+
+
+def test_optimizer_reflection_uses_feedback_split_not_validation_gate() -> None:
+    opt, _, _, _, _ = _optimizer(regime_enabled=False, feedback_batch_size=2)
+    proposer = RecordingProposer()
+    opt.proposer = proposer
+    initial = SkillArtifact(skill_id="z0", name="seed", document="seed")
+
+    opt.optimize(initial, RolloutBudget(max_rollouts=8))
+
+    assert len(proposer.trajectory_ids) == 2
+    assert all(
+        example_id.startswith("feedback_train_") for example_id in proposer.trajectory_ids
+    )
 
 
 class PoisonRepairProposer:
@@ -383,3 +420,56 @@ def test_optimizer_stops_when_rollout_budget_is_exhausted() -> None:
     assert result.budget.exhausted
     assert result.budget.spent_rollouts == 1
     assert result.iterations == []
+
+
+def test_jsonl_logger_writes_nested_iteration_payload(tmp_path) -> None:
+    trace_path = tmp_path / "experiment_trace.jsonl"
+    logger = JSONLLogger(trace_path)
+    opt, _, _, _, _ = _optimizer(regime_enabled=True, logger=logger)
+    initial = SkillArtifact(skill_id="z0", name="seed", document="seed")
+
+    opt.optimize(initial, RolloutBudget(max_rollouts=5))
+
+    lines = trace_path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1
+    payload = json.loads(lines[0])
+
+    # All required keys are present and serialize without error.
+    for key in (
+        "iteration",
+        "spent_rollouts",
+        "pool_edits",
+        "diffs",
+        "predictions",
+        "acquisition_scores",
+        "selected_ids",
+        "evals",
+        "gate_decisions",
+        "archive_snapshot",
+        "parent_selection",
+    ):
+        assert key in payload
+
+    assert payload["iteration"] == 0
+    assert payload["selected_ids"] == ["z_good"]
+    # pool_edits is the full proposed-edit array (nested objects).
+    assert isinstance(payload["pool_edits"], list) and payload["pool_edits"]
+    assert all("operation" in edit for edit in payload["pool_edits"])
+    # raw surrogate predictions are retained per pool candidate.
+    assert payload["predictions"]["z_good"]["mu"] == 0.8
+    # per-example accuracy is recorded for evaluated candidates.
+    assert "validation" in payload["evals"]["z_good"]
+    # archive snapshot carries ids and tiers.
+    assert any(row["candidate_id"] == "z_good" for row in payload["archive_snapshot"])
+    assert all("tier" in row for row in payload["archive_snapshot"])
+    assert all("artifact" in row for row in payload["archive_snapshot"])
+    # selected candidate diff is captured.
+    assert "z_good" in payload["diffs"]
+    # parent-selection pressure is auditable from the same trace.
+    assert payload["parent_selection"]["requested_parent_count"] == 1
+    assert payload["parent_selection"]["selected_ids"] == ["z0"]
+    assert payload["parent_selection"]["eligible_count"] == 1
+    parent_rows = payload["parent_selection"]["eligible"]
+    assert parent_rows[0]["candidate_id"] == "z0"
+    assert parent_rows[0]["selected"]
+    assert "weighted_logit" in parent_rows[0]["terms"]

@@ -1,6 +1,7 @@
 """Core typed contracts shared across all BESO modules."""
 
 from beso.core.types import (
+    ArchiveAdmissionMode,
     ArchiveEntry,
     Candidate,
     CandidateFeatures,
@@ -19,6 +20,7 @@ from beso.core.types import (
 )
 
 __all__ = [
+    "ArchiveAdmissionMode",
     "ArchiveEntry",
     "Candidate",
     "CandidateFeatures",

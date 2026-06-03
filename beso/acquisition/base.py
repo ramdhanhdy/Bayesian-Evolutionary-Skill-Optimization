@@ -42,10 +42,30 @@ class AcquisitionConfig:
     invalid_gamma: float = 0.1
     normalization: str = "zscore"
     eps: float = 1e-8
+    # Optional (lo, hi) clip applied to the expected-score (mu) term *only* when
+    # building the acquisition value. The surrogate keeps emitting raw,
+    # unbounded predictions; bounding here prevents an out-of-range mu from
+    # warping the pool-normalized a_BESO score (Spec: TICKET-003).
+    metric_bounds: tuple[float, float] | None = None
 
     def __post_init__(self) -> None:
         if self.normalization not in {"zscore", "minmax"}:
             raise ValueError("normalization must be 'zscore' or 'minmax'")
+        if self.metric_bounds is not None:
+            lo, hi = self.metric_bounds
+            if not (np.isfinite(lo) and np.isfinite(hi)):
+                raise ValueError("metric_bounds must be finite")
+            if lo > hi:
+                raise ValueError("metric_bounds must satisfy lo <= hi")
+
+
+def clip_to_bounds(value: float, bounds: tuple[float, float] | None) -> float:
+    """Clip ``value`` into ``bounds`` (inclusive); pass through when unset."""
+
+    if bounds is None:
+        return float(value)
+    lo, hi = bounds
+    return float(min(max(float(value), float(lo)), float(hi)))
 
 
 @dataclass(frozen=True)
@@ -230,6 +250,7 @@ __all__ = [
     "build_pool_statistics",
     "candidate_cost",
     "candidate_invalid_risk",
+    "clip_to_bounds",
     "compose_acquisition_score",
     "normalize_term",
     "normalized_terms",

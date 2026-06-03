@@ -4,6 +4,8 @@ Required environment:
     OPENROUTER_API_KEY=...
     # or
     DEEPSEEK_API_KEY=...
+    # or
+    OPENAI_API_KEY=...
 
 Optional environment:
     BESO_LITELLM_MODEL=deepseek/deepseek-chat
@@ -15,15 +17,21 @@ Optional environment:
     BESO_OPENROUTER_APP_NAME=BESO Toy Experiment
     BESO_DEEPSEEK_MODEL=deepseek/deepseek-chat
     BESO_DEEPSEEK_API_BASE=https://api.deepseek.com
+    BESO_OPENAI_MODEL=gpt-4o-mini
+    BESO_OPENAI_API_BASE=https://api.openai.com/v1
     BESO_GATE_ALPHA=0.10
     BESO_BH_ALPHA=0.10
     BESO_VALIDATION_BATCH_SIZE=10
     BESO_MAX_ROLLOUTS=160
+    BESO_TRACE_PATH=artifacts/toy_experiment.jsonl
 """
 
 from __future__ import annotations
 
 import os
+import random
+import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Sequence
 
@@ -34,6 +42,7 @@ from beso.acquisition import (
     BatchSelectionConfig,
     GreedySubmodularBatchSelector,
     PoolNormalizedBESOAcquisition,
+    clip_to_bounds,
 )
 from beso.adapters import (
     SkillOptDatasetProvider,
@@ -50,13 +59,13 @@ from beso.core.types import (
     RolloutBudget,
     SkillArtifact,
     SplitRole,
-    SurrogatePrediction,
 )
 from beso.features import FeatureExtractor, HashingEmbedder
 from beso.optimization import (
     AcceptanceGateConfig,
     BESOOptimizer,
     BESOOptimizerConfig,
+    JSONLLogger,
     PairedBootstrapAcceptanceGate,
     RegimeDetectorConfig,
     VarianceRankRegimeDetector,
@@ -87,6 +96,45 @@ load_dotenv_file(_PROJECT_ROOT / ".env")
 load_dotenv_file(Path.cwd() / ".env")
 
 
+class _LiteLLMRetryableResponseError(RuntimeError):
+    pass
+
+
+def _response_field(value: object, field: str) -> object:
+    if isinstance(value, dict):
+        return value.get(field)
+    return getattr(value, field, None)
+
+
+def _response_error_text(value: object) -> str:
+    error = _response_field(value, "error")
+    if error:
+        return str(error)
+    return ""
+
+
+def _validated_litellm_content(response: object) -> str:
+    choices = _response_field(response, "choices")
+    if not choices:
+        error_text = _response_error_text(response)
+        if error_text:
+            raise _LiteLLMRetryableResponseError(f"LiteLLM response included provider error: {error_text}")
+        raise RuntimeError("LiteLLM response did not include any choices")
+
+    choice = choices[0]
+    finish_reason = _response_field(choice, "finish_reason")
+    if str(finish_reason or "").lower() == "error":
+        error_text = _response_error_text(response)
+        detail = f": {error_text}" if error_text else ""
+        raise _LiteLLMRetryableResponseError(f"LiteLLM response finished with provider error{detail}")
+
+    message = _response_field(choice, "message")
+    content = _response_field(message, "content") if message is not None else None
+    if content is None or str(content).strip() == "":
+        raise _LiteLLMRetryableResponseError("LiteLLM response returned empty content")
+    return str(content)
+
+
 def env_value(*names: str, default: str = "") -> str:
     for name in names:
         value = os.getenv(name)
@@ -107,15 +155,24 @@ elif PROVIDER_HINT == "openrouter":
         "BESO_OPENROUTERL_MODEL",
         default=DEFAULT_MODEL,
     )
-else:
-    DEFAULT_MODEL = (
-        "deepseek/deepseek-chat"
-        if env_value("DEEPSEEK_API_KEY", "BESO_DEEPSEEK_API_KEY")
-        else "openrouter/openai/gpt-5"
+elif PROVIDER_HINT == "openai":
+    DEFAULT_MODEL = "gpt-4o-mini"
+    MODEL = env_value(
+        "BESO_LITELLM_MODEL",
+        "BESO_OPENAI_MODEL",
+        default=DEFAULT_MODEL,
     )
+else:
+    if env_value("DEEPSEEK_API_KEY", "BESO_DEEPSEEK_API_KEY"):
+        DEFAULT_MODEL = "deepseek/deepseek-chat"
+    elif env_value("OPENAI_API_KEY", "BESO_OPENAI_API_KEY"):
+        DEFAULT_MODEL = "gpt-4o-mini"
+    else:
+        DEFAULT_MODEL = "openrouter/openai/gpt-5"
     MODEL = env_value(
         "BESO_LITELLM_MODEL",
         "BESO_DEEPSEEK_MODEL",
+        "BESO_OPENAI_MODEL",
         "BESO_OPENROUTER_MODEL",
         "BESO_OPENROUTERL_MODEL",
         default=DEFAULT_MODEL,
@@ -123,6 +180,12 @@ else:
 SEED = int(env_value("BESO_SEED", default="7"))
 GATE_ALPHA = float(env_value("BESO_GATE_ALPHA", default="0.10"))
 BH_ALPHA = float(env_value("BESO_BH_ALPHA", default=str(GATE_ALPHA)))
+TRACE_PATH = Path(
+    env_value(
+        "BESO_TRACE_PATH",
+        default=str(_PROJECT_ROOT / "artifacts" / "toy_experiment.jsonl"),
+    )
+)
 
 REFLECTION_SYSTEM_INSTRUCTION = """You are BESO's deterministic skill mutation engine.
 
@@ -157,12 +220,17 @@ Hard requirements:
     directly explains failures, include multiple replace/delete edits that
     target that exact rule or its full section. Prefer replacing the faulty
     core_procedure over merely appending advice.
+14. The total skill artifact is allowed to grow. When evidence supports it,
+    propose comprehensive multi-rule additions, worked examples, recovery
+    guidance, and structured sections. The 500-token limit applies per edit,
+    not to the full evolved artifact.
 """
 
-TARGET_SYSTEM_INSTRUCTION = """You are executing a toy benchmark with a supplied skill.
-Follow the skill unless it is clearly self-contradictory with the task.
-For arithmetic tasks, compute carefully and return only the final integer.
-Do not include explanation, units, or punctuation.
+TARGET_SYSTEM_INSTRUCTION = """You are executing a benchmark with a supplied skill.
+Use only the supplied skill's procedure to solve the task.
+Do not introduce a procedure that is not stated in the skill.
+If the skill does not provide enough guidance to derive an answer, return 0.
+Return only the final answer. Do not include explanation, units, or punctuation.
 """
 
 INITIAL_SKILL = """# Skill: Toy Arithmetic
@@ -212,12 +280,17 @@ class LoggingBESOOptimizer(BESOOptimizer):
             reverse=True,
         )[:8]:
             pred = candidate.prediction
-            mu = pred.mu if pred is not None else float("nan")
+            mu_raw = pred.mu if pred is not None else float("nan")
+            mu_bounded = clip_to_bounds(
+                mu_raw,
+                self.acquisition.config.metric_bounds,
+            )
             sigma = pred.sigma if pred is not None else float("nan")
             acq = float(candidate.acquisition_score or 0.0)
             print(
                 f"  {candidate.candidate_id}: "
-                f"mu={mu:.3f} sigma={sigma:.3f} acq={acq:.3f}"
+                f"mu_raw={mu_raw:.3f} mu_bounded={mu_bounded:.3f} "
+                f"sigma={sigma:.3f} acq={acq:.3f}"
             )
         return use_surrogate, reason
 
@@ -250,15 +323,32 @@ def _provider_for_model(model: str) -> str:
         return "openrouter"
     if model.startswith("deepseek/") or model.startswith("deepseek-"):
         return "deepseek"
+    if model.startswith("gpt-") or model.startswith("openai/"):
+        return "openai"
+    if "/" in model:
+        parts = model.split("/", 1)
+        known_providers = {"openai", "deepseek", "openrouter", "azure", "anthropic", "cohere", "bedrock", "vertex_ai", "gemini", "groq", "together", "huggingface"}
+        if parts[0].lower() not in known_providers:
+            if env_value("OPENROUTER_API_KEY", "BESO_OPENROUTER_API_KEY"):
+                return "openrouter"
     return "generic"
 
 
 def _litellm_model_name(model: str, provider: str) -> str:
-    if provider == "deepseek" and "/" not in model:
+    if provider == "deepseek" and not model.startswith("deepseek/"):
         return f"deepseek/{model}"
-    if provider == "openrouter" and "/" not in model:
+    if provider == "openrouter" and not model.startswith("openrouter/"):
         return f"openrouter/{model}"
+    if provider == "openai" and "/" not in model and not model.startswith("gpt-"):
+        return f"openai/{model}"
     return model
+
+
+def _completion_temperature(model: str, temperature: float) -> float:
+    model_name = model.rsplit("/", 1)[-1].lower()
+    if model_name.startswith("gpt-5") and not model_name.startswith("gpt-5.1"):
+        return 1.0
+    return temperature
 
 
 def _api_key_for_provider(provider: str) -> str:
@@ -274,6 +364,12 @@ def _api_key_for_provider(provider: str) -> str:
             "BESO_OPENROUTER_API_KEY",
             "BESO_LITELLM_API_KEY",
         )
+    if provider == "openai":
+        return env_value(
+            "OPENAI_API_KEY",
+            "BESO_OPENAI_API_KEY",
+            "BESO_LITELLM_API_KEY",
+        )
     return env_value("BESO_LITELLM_API_KEY")
 
 
@@ -283,11 +379,13 @@ def litellm_completion(
     system: str,
     max_tokens: int,
     temperature: float = 0.0,
+    json_mode: bool = False,
 ) -> str:
     """Provider-aware LiteLLM chat completion."""
 
     try:
         import litellm
+        litellm.suppress_debug_info = True
     except ImportError as exc:
         raise RuntimeError("Install LiteLLM first: pip install litellm") from exc
 
@@ -297,7 +395,7 @@ def litellm_completion(
     if not api_key:
         raise RuntimeError(
             "Set a provider API key before running this script "
-            "(DEEPSEEK_API_KEY, OPENROUTER_API_KEY, or BESO_LITELLM_API_KEY)"
+            "(DEEPSEEK_API_KEY, OPENROUTER_API_KEY, OPENAI_API_KEY, or BESO_LITELLM_API_KEY)"
         )
 
     kwargs = {
@@ -307,14 +405,20 @@ def litellm_completion(
             {"role": "user", "content": prompt},
         ],
         "api_key": api_key,
-        "temperature": temperature,
+        "temperature": _completion_temperature(model, temperature),
         "max_tokens": max_tokens,
     }
+    if provider != "generic":
+        kwargs["custom_llm_provider"] = provider
+    if json_mode:
+        kwargs["response_format"] = {"type": "json_object"}
     api_base = env_value("BESO_LITELLM_API_BASE")
     if provider == "openrouter":
         api_base = api_base or env_value("BESO_OPENROUTER_API_BASE")
     elif provider == "deepseek":
         api_base = api_base or env_value("BESO_DEEPSEEK_API_BASE")
+    elif provider == "openai":
+        api_base = api_base or env_value("BESO_OPENAI_API_BASE")
     if api_base:
         kwargs["api_base"] = api_base
     headers = {}
@@ -325,9 +429,57 @@ def litellm_completion(
     if headers:
         kwargs["extra_headers"] = headers
 
-    response = litellm.completion(**kwargs)
-    message = response["choices"][0]["message"]
-    return str(message.get("content") or "")
+    max_retries = int(env_value("BESO_LITELLM_MAX_RETRIES", default="5"))
+    initial_delay = float(env_value("BESO_LITELLM_INITIAL_DELAY", default="2.0"))
+    backoff_factor = float(env_value("BESO_LITELLM_BACKOFF_FACTOR", default="2.0"))
+
+    exceptions = getattr(litellm, "exceptions", None)
+    RateLimitError = getattr(exceptions, "RateLimitError", None)
+    APIConnectionError = getattr(exceptions, "APIConnectionError", None)
+    ServiceUnavailableError = getattr(exceptions, "ServiceUnavailableError", None)
+
+    catch_exceptions = tuple(
+        exc for exc in [RateLimitError, APIConnectionError, ServiceUnavailableError] if exc is not None
+    )
+
+    delay = initial_delay
+    for attempt in range(max_retries + 1):
+        try:
+            response = litellm.completion(**kwargs)
+            return _validated_litellm_content(response)
+        except Exception as e:
+            is_retryable = False
+            if isinstance(e, _LiteLLMRetryableResponseError):
+                is_retryable = True
+            elif catch_exceptions and isinstance(e, catch_exceptions):
+                is_retryable = True
+            else:
+                err_msg = str(e).lower()
+                status_code = getattr(e, "status_code", getattr(e, "http_status", None))
+                if (
+                    status_code in (429, 500, 502, 503, 504)
+                    or "429" in err_msg
+                    or "rate limit" in err_msg
+                    or "too many requests" in err_msg
+                    or "503" in err_msg
+                    or "service unavailable" in err_msg
+                    or "502" in err_msg
+                    or "bad gateway" in err_msg
+                ):
+                    is_retryable = True
+
+            if is_retryable and attempt < max_retries:
+                jitter = random.uniform(0, 0.5 * delay)
+                sleep_time = delay + jitter
+                print(
+                    f"LiteLLM call hit retryable error: {e}. "
+                    f"Retrying in {sleep_time:.2f} seconds (attempt {attempt + 1}/{max_retries})...",
+                    flush=True,
+                )
+                time.sleep(sleep_time)
+                delay *= backoff_factor
+            else:
+                raise e
 
 
 def target_llm(prompt: str) -> str:
@@ -345,6 +497,7 @@ def reflection_llm(prompt: str) -> str:
         system=REFLECTION_SYSTEM_INSTRUCTION,
         max_tokens=int(env_value("BESO_REFLECTION_MAX_TOKENS", default="12000")),
         temperature=0.0,
+        json_mode=True,
     )
 
 
@@ -483,9 +636,17 @@ def toy_dataset() -> dict[SplitRole, list[dict]]:
     }
 
 
-def build_optimizer() -> LoggingBESOOptimizer:
-    dataset = SkillOptDatasetProvider(items_by_role=toy_dataset())
-    harness = SkillOptHarness(dataset, llm=target_llm, scorer=numeric_exact_score)
+def build_optimizer(
+    dataset: SkillOptDatasetProvider | None = None,
+    *,
+    trace_path: str | Path = TRACE_PATH,
+    target_generate: Callable[[str], str] = target_llm,
+    scorer: Callable[[str, dict], float] = numeric_exact_score,
+    feedback_batch_size: int | None = None,
+    harness: SkillOptHarness | None = None,
+) -> LoggingBESOOptimizer:
+    dataset = dataset or SkillOptDatasetProvider(items_by_role=toy_dataset())
+    harness = harness or SkillOptHarness(dataset, llm=target_generate, scorer=scorer)
     evaluator = SkillOptEvaluator(harness)
     archive = EvolutionaryArchive(
         ArchiveConfig(
@@ -494,10 +655,18 @@ def build_optimizer() -> LoggingBESOOptimizer:
             top_by_pareto=4,
             top_by_diversity=4,
             top_failed_informative=4,
+            parent_cost_beta=float(
+                env_value("BESO_PARENT_COST_BETA", default="0.02")
+            ),
         )
     )
     acquisition = PoolNormalizedBESOAcquisition(
-        AcquisitionConfig(kappa=1.5, diversity_lambda=0.2, cost_alpha=0.05),
+        AcquisitionConfig(
+            kappa=1.5,
+            diversity_lambda=0.2,
+            cost_alpha=float(env_value("BESO_COST_ALPHA", default="0.01")),
+            metric_bounds=(0.0, 1.0),
+        ),
         feature_lookup=archive.feature_lookup,
     )
     batch_selector = GreedySubmodularBatchSelector(
@@ -549,6 +718,11 @@ def build_optimizer() -> LoggingBESOOptimizer:
             optimization_batch_size=int(
                 env_value("BESO_OPTIMIZATION_BATCH_SIZE", default="3")
             ),
+            feedback_batch_size=(
+                int(env_value("BESO_FEEDBACK_BATCH_SIZE", default="3"))
+                if feedback_batch_size is None
+                else feedback_batch_size
+            ),
             validation_batch_size=int(
                 env_value("BESO_VALIDATION_BATCH_SIZE", default="10")
             ),
@@ -556,6 +730,7 @@ def build_optimizer() -> LoggingBESOOptimizer:
             fallback_strategy="greedy",
         ),
         multiplicity_correction=log_and_apply_bh,
+        logger=JSONLLogger(trace_path),
     )
 
 
@@ -568,6 +743,7 @@ def main() -> None:
     print(f"LiteLLM provider: {provider}")
     print("Reflection pool size: 24")
     print(f"Gate alpha: {GATE_ALPHA:.3f}; BH alpha: {BH_ALPHA:.3f}")
+    print(f"JSONL trace: {TRACE_PATH}")
     print(f"Provider API key: {key_status}\n")
 
     optimizer = build_optimizer()

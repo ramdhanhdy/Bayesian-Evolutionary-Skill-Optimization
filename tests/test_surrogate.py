@@ -149,7 +149,6 @@ def test_calibration_improves_coverage() -> None:
     assert surr.is_calibrated
 
     # Standardized residuals on observations should have ~unit variance.
-    feat_by_id = {f.candidate_id: f for f in features}
     pred_by_id = {p.candidate_id: p for p in surr.predict_many(features)}
     z2 = []
     for obs in observations:

@@ -15,6 +15,7 @@ from beso.acquisition.base import (
     build_pool_statistics,
     candidate_cost,
     candidate_invalid_risk,
+    clip_to_bounds,
     compose_acquisition_score,
     normalize_term,
 )
@@ -41,6 +42,7 @@ __all__ = [
     "candidate_distance",
     "candidate_invalid_risk",
     "candidate_novelty",
+    "clip_to_bounds",
     "compose_acquisition_score",
     "feature_distance",
     "normalize_term",
