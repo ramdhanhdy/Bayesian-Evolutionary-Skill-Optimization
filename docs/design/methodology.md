@@ -3,9 +3,9 @@ type: research-note
 tags: [beso, methodology, bayesian-optimization, evolutionary-search, skill-optimization, llm-agents]
 date: 2026-05-29
 source:
-  - [[Bayesian Evolutionary Skill Optimization (BESO) - Technical Specification]]
-  - [[Bayesian Evolutionary Skill Optimization (BESO) - Mathematical Breakdown]]
-  - [[Bayesian Evolutionary Skill Optimization (BESO) - GEPA SkillOpt BESO Mathematical Lineage]]
+  - [Technical specification](technical-specification.md)
+  - [Mathematical breakdown](mathematical-breakdown.md)
+  - [GEPA, SkillOpt, and BESO lineage](lineage.md)
 status: draft
 ---
 

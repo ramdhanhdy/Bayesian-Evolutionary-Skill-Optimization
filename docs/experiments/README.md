@@ -4,6 +4,9 @@ This directory stores durable experiment protocol notes and compact result
 summaries. Generated traces remain under `artifacts/` and should not be
 committed unless a small artifact is explicitly needed for review.
 
+See [experiment protocol](protocol.md) for minimum run metadata, evidence levels,
+and baseline-comparison rules.
+
 ## GSM8K Mini Conditions
 
 `examples/run_gsm8k_mini_experiment.py` now reports three conditions on one

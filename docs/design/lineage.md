@@ -3,8 +3,8 @@ type: research-note
 tags: [beso, gepa, skillopt, bayesian-optimization, evolutionary-search, skill-optimization, llm-agents]
 date: 2026-05-28
 source:
-  - [[Bayesian Evolutionary Skill Optimization (BESO) - Technical Specification]]
-  - [[Bayesian Evolutionary Skill Optimization (BESO) - Mathematical Breakdown]]
+  - [Technical specification](technical-specification.md)
+  - [Mathematical breakdown](mathematical-breakdown.md)
 external_sources:
   - https://gepa-ai.github.io/gepa/
   - https://arxiv.org/abs/2507.19457

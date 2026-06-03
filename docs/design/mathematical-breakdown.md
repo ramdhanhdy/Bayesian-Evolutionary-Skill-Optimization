@@ -2,7 +2,7 @@
 type: research-note
 tags: [beso, bayesian-optimization, evolutionary-search, skill-optimization, llm-agents]
 date: 2026-05-28
-source: [[Bayesian Evolutionary Skill Optimization (BESO) - Technical Specification]]
+source: [Technical specification](technical-specification.md)
 status: draft
 ---
 

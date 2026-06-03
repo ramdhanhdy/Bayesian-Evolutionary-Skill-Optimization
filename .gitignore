@@ -18,5 +18,3 @@ AGENTS.md
 /docs/notes/*
 docs/notes/high-performance-plateau-and-archive-admission.md
 docs/notes/high-performance-plateau-and-archive-admission.md
-docs/decisions/v0.0/0001-separate-deployable-promotion-from-exploration-archive-admission.md
-docs/decisions/README.md
